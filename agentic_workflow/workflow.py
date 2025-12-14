@@ -21,9 +21,9 @@ class ExtractionNode:
     @staticmethod
     def process(state: WorkflowState) -> WorkflowState:
         """Extract entities from input text"""
-        from phase_1_entity_extraction.entity_extractor import extract_from_text
+        from entity_extraction.entity_extractor import extract_from_text
         
-        print("🔄 [EXTRACT NODE] Processing text...")
+        print("Processing text...")
         
         if not state.text:
             state.validation_errors.append("No input text provided")
@@ -47,15 +47,11 @@ class ValidationNode:
     @staticmethod
     def process(state: WorkflowState) -> WorkflowState:
         """Validate extracted entities"""
-        print("✓ [VALIDATE NODE] Validating entities...")
+        print("Validating entities...")
         
         state.validation_passed = True
         
-        # Validation rules
-        if not state.extracted_entities:
-            state.validation_errors.append("No entities extracted")
-            state.validation_passed = False
-        
+        # Validation rules - allow empty entities but validate structure
         for entity in state.extracted_entities:
             if not entity.get('type'):
                 state.validation_errors.append("Entity missing type")
@@ -67,9 +63,9 @@ class ValidationNode:
                 state.validation_errors.append(f"Low confidence entity: {entity.get('value')}")
         
         if state.validation_passed:
-            print("✓ Validation passed")
+            print(f"Validation passed - {len(state.extracted_entities)} entities")
         else:
-            print(f"✗ Validation failed: {len(state.validation_errors)} error(s)")
+            print(f"Validation failed: {len(state.validation_errors)} error(s)")
         
         return state
 
@@ -79,7 +75,7 @@ class StorageNode:
     @staticmethod
     def process(state: WorkflowState) -> WorkflowState:
         """Store entities in databases"""
-        print("💾 [STORAGE NODE] Storing data...")
+        print("Storing data...")
         
         if not state.validation_passed:
             state.storage_status = "Skipped - validation failed"
@@ -96,7 +92,7 @@ class StorageNode:
             }
             
             state.storage_status = "Stored successfully"
-            print(f"✓ {len(state.extracted_entities)} entities ready for storage")
+            print(f"Entities ready for storage: {len(state.extracted_entities)}")
             
         except Exception as e:
             state.storage_status = f"Storage error: {str(e)}"
@@ -132,14 +128,15 @@ class AgenticWorkflow:
     def run(self, text: str) -> WorkflowState:
         """Execute the workflow"""
         print("\n" + "="*60)
-        print("🚀 AGENTIC WORKFLOW STARTED")
+        print("AGENTIC WORKFLOW STARTED")
         print("="*60)
         
         initial_state = WorkflowState(text=text)
-        final_state = self.graph.invoke(initial_state)
+        final_state_dict = self.graph.invoke(initial_state)
+        final_state = WorkflowState.model_validate(final_state_dict)
         
         print("\n" + "="*60)
-        print("🏁 AGENTIC WORKFLOW COMPLETED")
+        print("AGENTIC WORKFLOW COMPLETED")
         print("="*60)
         
         return final_state

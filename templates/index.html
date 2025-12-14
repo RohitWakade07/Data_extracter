@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Data Extraction Pipeline</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='graph-styles.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Document Extraction Pipeline</h1>
+            <p>Extract entities and relationships from your documents</p>
+        </header>
+
+        <main>
+            <!-- Upload Section -->
+            <section class="upload-section">
+                <div class="upload-box" id="uploadBox">
+                    <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                        <polyline points="17 8 12 3 7 8"></polyline>
+                        <line x1="12" y1="3" x2="12" y2="15"></line>
+                    </svg>
+                    <h2>Upload Document</h2>
+                    <p>Drag and drop your file or click to browse</p>
+                    <input type="file" id="fileInput" accept=".txt,.pdf,.docx,.doc,.png,.jpg,.jpeg,.tif,.tiff,.bmp" hidden>
+                    <button class="btn btn-primary" onclick="document.getElementById('fileInput').click()">
+                        Choose File
+                    </button>
+                    <p class="file-hint">Supported: TXT, PDF, DOCX, DOC, PNG, JPG, TIFF, BMP (Max 16MB)</p>
+                </div>
+            </section>
+
+            <!-- Processing Status -->
+            <section class="status-section" id="statusSection" style="display: none;">
+                <div class="status-card">
+                    <div class="spinner" id="spinner"></div>
+                    <p id="statusText">Processing your document...</p>
+                </div>
+            </section>
+
+            <!-- Results Section -->
+            <section class="results-section" id="resultsSection" style="display: none;">
+                <div class="results-card">
+                    <h2>Processing Complete</h2>
+                    
+                    <div class="result-item">
+                        <h3>File Information</h3>
+                        <p><strong>Filename:</strong> <span id="resultFilename"></span></p>
+                        <div class="text-preview">
+                            <p><strong>Text Preview:</strong></p>
+                            <pre id="textPreview"></pre>
+                        </div>
+                    </div>
+
+                    <div class="result-item">
+                        <h3>Extraction Results</h3>
+                        <div class="stats-grid">
+                            <div class="stat">
+                                <div class="stat-number" id="entitiesCount">0</div>
+                                <div class="stat-label">Entities Extracted</div>
+                                <button class="btn btn-details" onclick="toggleEntities()">View Details</button>
+                            </div>
+                            <div class="stat">
+                                <div class="stat-number" id="relationshipsCount">0</div>
+                                <div class="stat-label">Relationships Found</div>
+                                <button class="btn btn-details" onclick="toggleRelationships()">View Details</button>
+                            </div>
+                        </div>
+                        <button class="btn btn-primary" onclick="show3DGraph()" style="width: 100%; margin-top: 15px;">View 3D Graph</button>
+                    </div>
+
+                    <div class="result-item" id="entitiesSection" style="display: none;">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <h3>Extracted Entities</h3>
+                            <button class="btn btn-details" onclick="toggleEntities()" style="margin: 0;">Hide</button>
+                        </div>
+                        <div id="entitiesStructured" class="entities-container">
+                            <p>No entities extracted</p>
+                        </div>
+                    </div>
+
+                    <div class="result-item" id="relationshipsSection" style="display: none;">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <h3>Extracted Relationships</h3>
+                            <button class="btn btn-details" onclick="toggleRelationships()" style="margin: 0;">Hide</button>
+                        </div>
+                        <div id="relationshipsStructured" class="relationships-container">
+                            <p>No relationships extracted</p>
+                        </div>
+                    </div>
+
+                    <div class="result-item">
+                        <h3>Storage Information</h3>
+                        <p><strong>Vector Database UUID:</strong></p>
+                        <code id="vectorUUID">N/A</code>
+                        <p style="margin-top: 10px;"><strong>Workflow Status:</strong></p>
+                        <code id="workflowStatus">unknown</code>
+                    </div>
+
+                    <button class="btn btn-secondary" onclick="resetForm()">Process Another Document</button>
+                </div>
+            </section>
+
+            <!-- 3D Graph Modal -->
+            <section class="modal" id="graphModal" style="display: none;">
+                <div class="modal-content" id="graphModalContent">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <h2>Entity Relationship Graph (3D)</h2>
+                        <button class="btn btn-details" onclick="close3DGraph()" style="margin: 0;">Close</button>
+                    </div>
+                    <div id="graphContainer" class="graph-container"></div>
+                    <p style="margin-top: 10px; font-size: 0.85em; color: #666;">
+                        <strong>Controls:</strong> Drag to rotate • Scroll to zoom • Right-click to pan
+                    </p>
+                </div>
+            </section>
+
+            <!-- Error Section -->
+            <section class="error-section" id="errorSection" style="display: none;">
+                <div class="error-card">
+                    <h2>Error Occurred</h2>
+                    <p id="errorMessage"></p>
+                    <button class="btn btn-secondary" onclick="resetForm()">Try Again</button>
+                </div>
+            </section>
+        </main>
+
+        <footer>
+            <p>Data Extraction Pipeline &copy; 2024 | Powered by NebulaGraph + Weaviate</p>
+        </footer>
+    </div>
+
+    <!-- Three.js for 3D visualization -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>

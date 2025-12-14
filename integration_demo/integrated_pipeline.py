@@ -3,10 +3,10 @@
 
 import json
 from typing import Dict, Any, List
-from phase_1_entity_extraction.entity_extractor import extract_from_text
-from phase_2_agentic_workflow.workflow import run_workflow
-from phase_3_vector_database.weaviate_handler import store_in_weaviate, Document
-from phase_4_knowledge_graph.nebula_handler import store_in_nebula
+from entity_extraction.entity_extractor import extract_from_text
+from agentic_workflow.workflow import run_workflow
+from vector_database.weaviate_handler import store_in_weaviate, Document
+from knowledge_graph.nebula_handler import store_in_nebula
 
 class IntegratedPipeline:
     """Complete end-to-end extraction pipeline"""
@@ -26,22 +26,22 @@ class IntegratedPipeline:
         """
         
         print("\n" + "="*70)
-        print("🚀 COMPLETE AUTOMATED DATA EXTRACTION PIPELINE")
+        print("COMPLETE AUTOMATED DATA EXTRACTION PIPELINE")
         print("="*70)
         
         # Phase 2: Run agentic workflow
-        print("\n📋 PHASE 2: AGENTIC WORKFLOW")
+        print("\n== PHASE 2: AGENTIC WORKFLOW")
         workflow_result = run_workflow(unstructured_text)
         self.results["workflow"] = workflow_result
         
         entities = workflow_result.get("entities", [])
         
         if not entities:
-            print("⚠ No entities extracted. Pipeline incomplete.")
+            print("No entities extracted. Pipeline incomplete.")
             return self.results
         
         # Phase 3: Store in Weaviate
-        print("\n📊 PHASE 3: VECTOR DATABASE (WEAVIATE)")
+        print("\n== PHASE 3: VECTOR DATABASE (WEAVIATE)")
         doc = Document(
             id="doc_001",
             content=unstructured_text,
@@ -52,34 +52,92 @@ class IntegratedPipeline:
         self.results["vector_storage"] = vector_result
         
         # Phase 4: Store in NebulaGraph
-        print("\n🔗 PHASE 4: KNOWLEDGE GRAPH (NEBULA)")
+        print("\n== PHASE 4: KNOWLEDGE GRAPH (NEBULA)")
         relationships = self._generate_relationships(entities)
+        self.results["relationships"] = relationships
         graph_result = store_in_nebula(entities, relationships)
         self.results["graph_storage"] = graph_result
         
         # Phase 5: Execute queries
-        print("\n🔍 PHASE 5: EXECUTE QUERIES")
+        print("\n== PHASE 5: EXECUTE QUERIES")
         self._demonstrate_queries(entities)
         
         return self.results
     
     def _generate_relationships(self, entities: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-        """Generate relationships between entities"""
+        """Generate relationships between entities with type information"""
         relationships = []
         
-        # Simple relationship generation logic
+        # Helper function to create consistent entity IDs
+        def make_entity_id(entity_type: str, entity_value: str) -> str:
+            """Create consistent entity ID from type and value"""
+            clean = entity_value.replace('\n', ' ').strip()  # Replace newlines with space, strip
+            clean = clean.replace(' ', '_')  # Replace all spaces with underscore
+            # Normalize multiple underscores to single underscore
+            while '__' in clean:
+                clean = clean.replace('__', '_')
+            return f"{entity_type}_{clean}"
+        
+        # Group entities by type
         person_entities = [e for e in entities if e.get("type") == "person"]
         org_entities = [e for e in entities if e.get("type") == "organization"]
+        date_entities = [e for e in entities if e.get("type") == "date"]
+        amount_entities = [e for e in entities if e.get("type") == "amount"]
+        location_entities = [e for e in entities if e.get("type") == "location"]
         
-        # Connect persons to organizations
+        # Person → Organization (WORKS_AT)
         for person in person_entities:
             for org in org_entities:
-                person_id = f"person_{person.get('value', '').replace(' ', '_')}"
-                org_id = f"organization_{org.get('value', '').replace(' ', '_')}"
+                person_id = make_entity_id("person", person.get('value', ''))
+                org_id = make_entity_id("organization", org.get('value', ''))
                 relationships.append({
                     "from_id": person_id,
                     "to_id": org_id,
-                    "type": "works_at",
+                    "from_type": "person",
+                    "to_type": "organization",
+                    "type": "WORKS_AT",
+                    "confidence": 0.9
+                })
+        
+        # Person → Location (LOCATED_IN)
+        for person in person_entities:
+            for location in location_entities:
+                person_id = make_entity_id("person", person.get('value', ''))
+                loc_id = make_entity_id("location", location.get('value', ''))
+                relationships.append({
+                    "from_id": person_id,
+                    "to_id": loc_id,
+                    "from_type": "person",
+                    "to_type": "location",
+                    "type": "LOCATED_IN",
+                    "confidence": 0.8
+                })
+        
+        # Organization → Amount (HAS_AMOUNT)
+        for org in org_entities:
+            for amount in amount_entities:
+                org_id = make_entity_id("organization", org.get('value', ''))
+                amt_id = make_entity_id("amount", amount.get('value', ''))
+                relationships.append({
+                    "from_id": org_id,
+                    "to_id": amt_id,
+                    "from_type": "organization",
+                    "to_type": "amount",
+                    "type": "HAS_AMOUNT",
+                    "confidence": 0.95
+                })
+        
+        # Amount → Date (EFFECTIVE_ON)
+        for amount in amount_entities:
+            for date in date_entities:
+                amt_id = make_entity_id("amount", amount.get('value', ''))
+                date_id = make_entity_id("date", date.get('value', ''))
+                relationships.append({
+                    "from_id": amt_id,
+                    "to_id": date_id,
+                    "from_type": "amount",
+                    "to_type": "date",
+                    "type": "EFFECTIVE_ON",
                     "confidence": 0.9
                 })
         
@@ -104,7 +162,7 @@ class IntegratedPipeline:
         
         persons = [e for e in entities if e.get("type") == "person"]
         if persons:
-            person_name = persons[0].get("value")
+            person_name = persons[0].get("value", "")
             person_id = f"person_{person_name.replace(' ', '_')}"
             
             query = f'FETCH PROP ON Person "{person_id}";'
@@ -139,7 +197,7 @@ def main():
     
     # Print summary
     print("\n" + "="*70)
-    print("✅ PIPELINE EXECUTION COMPLETE")
+    print("PIPELINE EXECUTION COMPLETE")
     print("="*70)
     print("\nSummary:")
     print(f"- Workflow Status: {results.get('workflow', {}).get('status', 'unknown')}")
