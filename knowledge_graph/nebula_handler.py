@@ -1,5 +1,4 @@
-# Phase 4 - Knowledge Graph (NebulaGraph)
-# Store entities as nodes and relationships as edges
+
 
 from typing import List, Dict, Any, Optional
 import json
@@ -11,7 +10,10 @@ ENTITY_TAG_MAP = {
     "organization": "Organization",
     "amount": "Amount",
     "date": "Date",
-    "location": "Location"
+    "location": "Location",
+    "project": "Project",
+    "invoice": "Invoice",
+    "agreement": "Agreement"
 }
 
 # Relationship mapping rules
@@ -22,6 +24,16 @@ RELATIONSHIP_MAP = {
     ("Organization", "Location"): "LOCATED_IN",
     ("Organization", "Amount"): "HAS_AMOUNT",
     ("Amount", "Date"): "EFFECTIVE_ON",
+    ("Person", "Project"): "WORKS_ON",
+    ("Organization", "Project"): "MANAGES",
+    ("Organization", "Invoice"): "ISSUED",
+    ("Invoice", "Organization"): "BILLED_TO",
+    ("Organization", "Agreement"): "PARTY_TO",
+    ("Agreement", "Date"): "SIGNED_ON",
+    ("Agreement", "Amount"): "HAS_VALUE",
+    ("Invoice", "Amount"): "HAS_AMOUNT",
+    ("Invoice", "Date"): "DUE_ON",
+    ("Project", "Location"): "LOCATED_IN",
 }
 
 
@@ -44,9 +56,7 @@ class NebulaGraphClient:
 
         self.pool = self._initialize_pool()
 
-    # ------------------------------------------------------------------
-    # Connection & Session Handling
-    # ------------------------------------------------------------------
+   
     def _initialize_pool(self):
         """Initialize NebulaGraph connection pool"""
         try:
@@ -76,9 +86,7 @@ class NebulaGraphClient:
             return None
         return self.pool.get_session(self.user, self.password)
 
-    # ------------------------------------------------------------------
-    # Schema Creation
-    # ------------------------------------------------------------------
+    
     def create_space(self) -> bool:
         """Create graph space and schema"""
         session = self._get_session()
@@ -136,6 +144,27 @@ class NebulaGraphClient:
                 )
             """)
 
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Project(
+                    name string,
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Invoice(
+                    name string,
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Agreement(
+                    name string,
+                    confidence float
+                )
+            """)
+
             # ----------------- EDGES -----------------
             session.execute("""
                 CREATE EDGE IF NOT EXISTS WORKS_AT(
@@ -167,7 +196,86 @@ class NebulaGraphClient:
                 )
             """)
 
-            print("Graph schema created successfully")
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS WORKS_ON(
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS MANAGES(
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS ISSUED(
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS BILLED_TO(
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS PARTY_TO(
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS HAS_VALUE(
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS DUE_ON(
+                    confidence float
+                )
+            """)
+
+            print("Graph schema created successfully. Creating indexes for MATCH queries...")
+            time.sleep(3)  # Wait for schema to propagate
+            
+            # Create tag indexes for LOOKUP queries to work
+            tag_types = ['Person', 'Organization', 'Location', 'Project', 'Invoice', 'Agreement', 'Amount', 'Date']
+            for tag in tag_types:
+                try:
+                    session.execute(f"CREATE TAG INDEX IF NOT EXISTS idx_{tag.lower()} ON `{tag}`()")
+                except Exception as idx_err:
+                    print(f"Index creation for {tag} skipped: {idx_err}")
+            
+            # Create edge indexes for ALL edge types
+            edge_types = ['WORKS_AT', 'LOCATED_IN', 'WORKS_ON', 'MANAGES', 'PARTY_TO', 
+                          'SIGNED_ON', 'HAS_AMOUNT', 'EFFECTIVE_ON', 'HAS_VALUE', 'ISSUED', 'DUE_ON', 'BILLED_TO']
+            for edge in edge_types:
+                try:
+                    session.execute(f"CREATE EDGE INDEX IF NOT EXISTS idx_{edge.lower()} ON `{edge}`()")
+                except Exception as idx_err:
+                    print(f"Edge index creation for {edge} skipped: {idx_err}")
+            
+            print("Indexes created. Rebuilding indexes...")
+            time.sleep(2)
+            
+            # Rebuild indexes to make existing data queryable
+            for tag in tag_types:
+                try:
+                    session.execute(f"REBUILD TAG INDEX idx_{tag.lower()}")
+                except:
+                    pass
+            
+            for edge in edge_types:
+                try:
+                    session.execute(f"REBUILD EDGE INDEX idx_{edge.lower()}")
+                except:
+                    pass
+            
+            print("Schema and indexes ready.")
+            time.sleep(3)  # Wait for index rebuild
             return True
 
         except Exception as e:
@@ -195,7 +303,7 @@ class NebulaGraphClient:
         try:
             session.execute(f"USE {self.space}")
 
-            # Standardize entity type using ENTITY_TAG_MAP
+            
             tag = ENTITY_TAG_MAP.get(entity_type.lower(), entity_type.capitalize())
             
             # Clean entity value: remove newlines and strip whitespace
@@ -307,6 +415,134 @@ class NebulaGraphClient:
         finally:
             session.release()
 
+    def get_all_entities(self) -> List[Dict[str, Any]]:
+        """Get all entities from the graph using LOOKUP with tag indexes"""
+        session = self._get_session()
+        if not session:
+            return []
+
+        try:
+            session.execute(f"USE {self.space}")
+            
+            entities = []
+            # Query each entity type tag using LOOKUP
+            tag_types = ['Person', 'Organization', 'Location', 'Project', 'Invoice', 'Agreement', 'Amount', 'Date']
+            
+            for tag_type in tag_types:
+                try:
+                    # LOOKUP with proper YIELD
+                    if tag_type in ['Date', 'Amount']:
+                        result = session.execute(f"LOOKUP ON `{tag_type}` YIELD id(vertex) as vid, properties(vertex).value as name")
+                    else:
+                        result = session.execute(f"LOOKUP ON `{tag_type}` YIELD id(vertex) as vid, properties(vertex).name as name")
+                    
+                    if result.is_succeeded():
+                        # Use as_primitive() which returns a list of dicts
+                        data = result.as_primitive()
+                        for row in data:
+                            name = row.get('name', '')
+                            if name:
+                                entities.append({
+                                    "id": row.get('vid', ''),
+                                    "name": name,
+                                    "type": tag_type.lower(),
+                                    "confidence": 0.8
+                                })
+                    else:
+                        print(f"LOOKUP for {tag_type}: {result.error_msg()}")
+                except Exception as tag_err:
+                    print(f"Query for {tag_type} failed: {tag_err}")
+                    continue
+            
+            return entities
+
+        except Exception as e:
+            print(f"Get entities error: {e}")
+            return []
+
+        finally:
+            session.release()
+
+    def get_all_relationships(self) -> List[Dict[str, Any]]:
+        """Get all relationships from the graph using LOOKUP"""
+        session = self._get_session()
+        if not session:
+            return []
+
+        try:
+            session.execute(f"USE {self.space}")
+            
+            relationships = []
+            # Query all edge types using LOOKUP
+            edge_types = ['WORKS_AT', 'LOCATED_IN', 'WORKS_ON', 'MANAGES', 'PARTY_TO', 
+                          'SIGNED_ON', 'HAS_AMOUNT', 'EFFECTIVE_ON', 'HAS_VALUE', 'ISSUED', 'DUE_ON']
+            
+            for edge_type in edge_types:
+                try:
+                    result = session.execute(f"LOOKUP ON `{edge_type}` YIELD src(edge) as src, dst(edge) as dst")
+                    
+                    if result.is_succeeded():
+                        data = result.as_primitive()
+                        for row in data:
+                            src = row.get('src', '')
+                            dst = row.get('dst', '')
+                            if src and dst:
+                                relationships.append({
+                                    "source": src,
+                                    "type": edge_type,
+                                    "target": dst
+                                })
+                    else:
+                        print(f"LOOKUP for edge {edge_type}: {result.error_msg()}")
+                except Exception as edge_err:
+                    print(f"Query for {edge_type} failed: {edge_err}")
+                    continue
+            
+            return relationships
+
+        except Exception as e:
+            print(f"Get relationships error: {e}")
+            return []
+
+        finally:
+            session.release()
+
+    def get_graph_stats(self) -> Dict[str, int]:
+        """Get graph statistics using SHOW STATS"""
+        session = self._get_session()
+        if not session:
+            return {"entities": 0, "relationships": 0}
+
+        try:
+            session.execute(f"USE {self.space}")
+            
+            # Use SHOW STATS which returns pre-computed statistics
+            result = session.execute("SHOW STATS")
+            
+            if result.is_succeeded():
+                entity_count = 0
+                rel_count = 0
+                
+                # Parse the stats result
+                data = result.as_primitive()
+                for item in data:
+                    if item.get('Type') == 'Space' and item.get('Name') == 'vertices':
+                        entity_count = item.get('Count', 0)
+                    elif item.get('Type') == 'Space' and item.get('Name') == 'edges':
+                        rel_count = item.get('Count', 0)
+                
+                return {"entities": entity_count, "relationships": rel_count}
+            else:
+                print(f"SHOW STATS error: {result.error_msg()}")
+                return {"entities": 0, "relationships": 0}
+
+        except Exception as e:
+            print(f"Get stats error: {e}")
+            return {"entities": 0, "relationships": 0}
+
+        finally:
+            session.release()
+
 
 # ------------------------------------------------------------------
 # Helper Function for Pipeline Integration
@@ -371,32 +607,13 @@ def store_in_nebula(
     return results
 
 
-# ------------------------------------------------------------------
-# Example Run
-# ------------------------------------------------------------------
-if __name__ == "__main__":
-    sample_entities = [
-        {"type": "person", "value": "John Smith", "confidence": 0.95},
-        {"type": "organization", "value": "Acme Corporation", "confidence": 0.92},
-        {"type": "date", "value": "2024-12-14", "confidence": 1.0},
-        {"type": "amount", "value": "$50,000", "confidence": 0.88}
-    ]
+def execute_graph_query(query: str, host: str = "127.0.0.1", port: int = 9669) -> Any:
+    """Execute a raw query against NebulaGraph"""
+    client = NebulaGraphClient(host=host, port=port)
+    result = client.query_graph(query)
+    if result["success"]:
+        return result["result"]
+    else:
+        print(f"Query failed: {result.get('error')}")
+        return None
 
-    sample_relationships = [
-        {
-            "from_id": "person_John_Smith",
-            "to_id": "organization_Acme_Corporation",
-            "type": "works_at",
-            "confidence": 0.9
-        },
-        {
-            "from_id": "person_John_Smith",
-            "to_id": "date_2024-12-14",
-            "type": "signed_on",
-            "confidence": 0.95
-        }
-    ]
-
-    result = store_in_nebula(sample_entities, sample_relationships)
-    print("\nFinal Result:")
-    print(json.dumps(result, indent=2))

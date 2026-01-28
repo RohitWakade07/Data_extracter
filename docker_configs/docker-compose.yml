@@ -6,6 +6,7 @@ services:
     image: semitechnologies/weaviate:latest
     ports:
       - "8080:8080"
+      - "8081:8081"
     environment:
       QUERY_DEFAULTS_LIMIT: 25
       AUTHENTICATION_APIKEY_ENABLED: 'false'
@@ -17,7 +18,7 @@ services:
   nebula-graphd:
     image: vesoft/nebula-graphd:latest
     ports:
-      - "3669:3669"
+      - "9669:9669"
     environment:
       - GOD_ENABLE_GRAPH_NEBULA_SYSTEM_SPACE=true
     volumes:

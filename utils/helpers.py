@@ -82,8 +82,4 @@ def merge_results(results_list: List[Dict[str, Any]]) -> Dict[str, Any]:
     
     return merged
 
-if __name__ == "__main__":
-    print_section("Utility Functions Test")
-    print_subsection("Creating Entity ID")
-    entity_id = create_entity_id("person", "John Smith")
-    print(f"Entity ID: {entity_id}")
+

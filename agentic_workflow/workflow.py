@@ -1,5 +1,4 @@
-# Phase 2 - Agentic Workflow using LangGraph
-# Multi-node agent flow: Extract → Validate → Store → End
+
 
 from typing import Dict, List, Any, Annotated
 from langgraph.graph import StateGraph, END
@@ -36,7 +35,12 @@ class ExtractionNode:
                 for e in result.entities
             ]
             print(f"✓ Extracted {len(state.extracted_entities)} entities")
+            if not state.extracted_entities:
+                print("  WARNING: No entities extracted from text. Check if LLM API keys are configured.")
+                print("  The system will use fallback rule-based extraction.")
         except Exception as e:
+            print(f"  ERROR during extraction: {str(e)[:100]}")
+            print("  Attempting to continue with extracted entities or fallback...")
             state.validation_errors.append(f"Extraction error: {str(e)}")
         
         return state
@@ -152,13 +156,3 @@ def run_workflow(text: str) -> Dict[str, Any]:
         "final_result": result.final_result
     }
 
-if __name__ == "__main__":
-    # Example usage
-    sample_text = """
-    Jane Doe from Google signed a deal with Microsoft on 2024-12-14 worth $100 million.
-    The headquarters will be in San Francisco.
-    """
-    
-    result = run_workflow(sample_text)
-    print("\nWorkflow Result:")
-    print(json.dumps(result, indent=2))

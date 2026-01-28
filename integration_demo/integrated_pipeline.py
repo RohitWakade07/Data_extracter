@@ -65,15 +65,14 @@ class IntegratedPipeline:
         return self.results
     
     def _generate_relationships(self, entities: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-        """Generate relationships between entities with type information"""
+        """Generate relationships between entities with context-based matching"""
         relationships = []
         
         # Helper function to create consistent entity IDs
         def make_entity_id(entity_type: str, entity_value: str) -> str:
             """Create consistent entity ID from type and value"""
-            clean = entity_value.replace('\n', ' ').strip()  # Replace newlines with space, strip
-            clean = clean.replace(' ', '_')  # Replace all spaces with underscore
-            # Normalize multiple underscores to single underscore
+            clean = entity_value.replace('\n', ' ').strip()
+            clean = clean.replace(' ', '_')
             while '__' in clean:
                 clean = clean.replace('__', '_')
             return f"{entity_type}_{clean}"
@@ -81,22 +80,154 @@ class IntegratedPipeline:
         # Group entities by type
         person_entities = [e for e in entities if e.get("type") == "person"]
         org_entities = [e for e in entities if e.get("type") == "organization"]
-        date_entities = [e for e in entities if e.get("type") == "date"]
-        amount_entities = [e for e in entities if e.get("type") == "amount"]
         location_entities = [e for e in entities if e.get("type") == "location"]
+        amount_entities = [e for e in entities if e.get("type") == "amount"]
+        date_entities = [e for e in entities if e.get("type") == "date"]
+        project_entities = [e for e in entities if e.get("type") == "project"]
+        invoice_entities = [e for e in entities if e.get("type") == "invoice"]
+        agreement_entities = [e for e in entities if e.get("type") == "agreement"]
         
-        # Person → Organization (WORKS_AT)
-        for person in person_entities:
-            for org in org_entities:
+        # Debug: Print what was found
+        print(f"\nRelationship Generation Debug:")
+        print(f"  Persons: {len(person_entities)}")
+        print(f"  Organizations: {len(org_entities)}")
+        print(f"  Projects: {len(project_entities)}")
+        print(f"  Invoices: {len(invoice_entities)}")
+        print(f"  Agreements: {len(agreement_entities)}")
+        
+        # IMPROVED: Only match high-confidence entities
+        # Threshold: persons with confidence >= 0.85, orgs with confidence >= 0.80
+        high_conf_persons = [e for e in person_entities if e.get('confidence', 0) >= 0.85]
+        high_conf_orgs = [e for e in org_entities if e.get('confidence', 0) >= 0.80]
+        
+        print(f"  High-confidence Persons (>=0.85): {len(high_conf_persons)}")
+        print(f"  High-confidence Organizations (>=0.80): {len(high_conf_orgs)}")
+        
+        # Person → Organization (WORKS_AT) relationships
+        # Only create relationships between high-confidence entities
+        for person in high_conf_persons:
+            for org in high_conf_orgs:
                 person_id = make_entity_id("person", person.get('value', ''))
                 org_id = make_entity_id("organization", org.get('value', ''))
+                
+                # Relationship confidence based on entity confidences
+                relationship_confidence = min(0.95, (person.get('confidence', 0.5) + org.get('confidence', 0.5)) / 2.2)
+                
                 relationships.append({
                     "from_id": person_id,
                     "to_id": org_id,
                     "from_type": "person",
                     "to_type": "organization",
                     "type": "WORKS_AT",
+                    "confidence": relationship_confidence
+                })
+
+        # Person → Project (WORKS_ON)
+        for person in high_conf_persons:
+            for proj in project_entities:
+                relationships.append({
+                    "from_id": make_entity_id("person", person.get('value', '')),
+                    "to_id": make_entity_id("project", proj.get('value', '')),
+                    "from_type": "person",
+                    "to_type": "project",
+                    "type": "WORKS_ON",
+                    "confidence": 0.8
+                })
+
+        # Organization → Project (MANAGES)
+        for org in high_conf_orgs:
+            for proj in project_entities:
+                relationships.append({
+                    "from_id": make_entity_id("organization", org.get('value', '')),
+                    "to_id": make_entity_id("project", proj.get('value', '')),
+                    "from_type": "organization",
+                    "to_type": "project",
+                    "type": "MANAGES",
+                    "confidence": 0.85
+                })
+
+        # Organization → Invoice (ISSUED)
+        for org in high_conf_orgs:
+            for inv in invoice_entities:
+                relationships.append({
+                    "from_id": make_entity_id("organization", org.get('value', '')),
+                    "to_id": make_entity_id("invoice", inv.get('value', '')),
+                    "from_type": "organization",
+                    "to_type": "invoice",
+                    "type": "ISSUED",
+                    "confidence": 0.85
+                })
+
+        # Organization → Agreement (PARTY_TO)
+        for org in high_conf_orgs:
+            for agr in agreement_entities:
+                relationships.append({
+                    "from_id": make_entity_id("organization", org.get('value', '')),
+                    "to_id": make_entity_id("agreement", agr.get('value', '')),
+                    "from_type": "organization",
+                    "to_type": "agreement",
+                    "type": "PARTY_TO",
+                    "confidence": 0.85
+                })
+
+        # Invoice → Amount (HAS_AMOUNT)
+        for inv in invoice_entities:
+            for amt in amount_entities:
+                relationships.append({
+                    "from_id": make_entity_id("invoice", inv.get('value', '')),
+                    "to_id": make_entity_id("amount", amt.get('value', '')),
+                    "from_type": "invoice",
+                    "to_type": "amount",
+                    "type": "HAS_AMOUNT",
                     "confidence": 0.9
+                })
+
+        # Invoice → Date (DUE_ON)
+        for inv in invoice_entities:
+            for date in date_entities:
+                relationships.append({
+                    "from_id": make_entity_id("invoice", inv.get('value', '')),
+                    "to_id": make_entity_id("date", date.get('value', '')),
+                    "from_type": "invoice",
+                    "to_type": "date",
+                    "type": "DUE_ON",
+                    "confidence": 0.7
+                })
+
+        # Agreement → Amount (HAS_VALUE)
+        for agr in agreement_entities:
+            for amt in amount_entities:
+                relationships.append({
+                    "from_id": make_entity_id("agreement", agr.get('value', '')),
+                    "to_id": make_entity_id("amount", amt.get('value', '')),
+                    "from_type": "agreement",
+                    "to_type": "amount",
+                    "type": "HAS_VALUE",
+                    "confidence": 0.8
+                })
+
+        # Agreement → Date (SIGNED_ON)
+        for agr in agreement_entities:
+            for date in date_entities:
+                relationships.append({
+                    "from_id": make_entity_id("agreement", agr.get('value', '')),
+                    "to_id": make_entity_id("date", date.get('value', '')),
+                    "from_type": "agreement",
+                    "to_type": "date",
+                    "type": "SIGNED_ON",
+                    "confidence": 0.7
+                })
+        
+        # Project → Location (LOCATED_IN)
+        for proj in project_entities:
+            for loc in location_entities:
+                relationships.append({
+                    "from_id": make_entity_id("project", proj.get('value', '')),
+                    "to_id": make_entity_id("location", loc.get('value', '')),
+                    "from_type": "project",
+                    "to_type": "location",
+                    "type": "LOCATED_IN",
+                    "confidence": 0.8
                 })
         
         # Person → Location (LOCATED_IN)
@@ -141,70 +272,78 @@ class IntegratedPipeline:
                     "confidence": 0.9
                 })
         
+        print(f"  Generated relationships: {len(relationships)}")
         return relationships
     
     def _demonstrate_queries(self, entities: List[Dict[str, Any]]):
-        """Demonstrate semantic and graph queries"""
+        """Execute semantic and graph queries"""
         
-        # Semantic Query Example
+        # Semantic Query - Weaviate
         print("\n" + "-"*70)
         print("SEMANTIC QUERY (Weaviate)")
         print("-"*70)
-        query = "contracts and agreements"
-        print(f"Query: '{query}'")
+        query_text = "contracts and agreements"
+        print(f"Query: '{query_text}'")
         print("Expected: Return similar documents using vector similarity")
-        print("(Actual execution requires Weaviate to be running)")
         
-        # Graph Query Example
+        try:
+            from vector_database.weaviate_handler import query_weaviate
+            results = query_weaviate(query_text)
+            if results:
+                print(f"\n✓ Found {len(results)} similar documents:")
+                for i, result in enumerate(results[:3], 1):  # Show top 3
+                    print(f"  {i}. Score: {result.get('score', 'N/A')}")
+            else:
+                print("(No results or Weaviate not responding)")
+        except Exception as e:
+            print(f"(Query execution error: {str(e)[:50]}...)")
+        
+        # Graph Query - NebulaGraph
         print("\n" + "-"*70)
         print("GRAPH QUERY (NebulaGraph)")
         print("-"*70)
         
         persons = [e for e in entities if e.get("type") == "person"]
         if persons:
-            person_name = persons[0].get("value", "")
-            person_id = f"person_{person_name.replace(' ', '_')}"
-            
-            query = f'FETCH PROP ON Person "{person_id}";'
-            print(f"Query: Fetch all properties of person: {person_name}")
-            print("Expected: Return person node with all attributes")
-            print(f"(Graph query would be: {query})")
+            try:
+                from knowledge_graph.nebula_handler import execute_graph_query
+                person_name = persons[0].get("value", "")
+                person_id = f'"{person_name}"'
+                
+                query = f'FETCH PROP ON Person {person_id};'
+                print(f"Query: Fetch all properties of person: {person_name}")
+                print("Expected: Return person node with all attributes")
+                
+                result = execute_graph_query(query)
+                if result:
+                    print(f"✓ Query executed successfully")
+                    print(f"Result: {result}")
+                else:
+                    print("(Query returned no results)")
+            except Exception as e:
+                print(f"(Query execution error: {str(e)[:50]}...)")
+        else:
+            print("No persons found to query")
         
-        # Relationship Query
+        # Relationship Query - NebulaGraph
         print("\n" + "-"*70)
         print("RELATIONSHIP QUERY (NebulaGraph)")
         print("-"*70)
         print("Query: Find all organizations associated with extracted persons")
         print("Expected: Return graph paths showing person->works_at->organization")
-        print("(Actual execution requires NebulaGraph to be running)")
+        
+        try:
+            from knowledge_graph.nebula_handler import execute_graph_query
+            
+            # Find all person->works_at->organization relationships
+            query = 'MATCH (p:Person)-[e:WORKS_AT]->(o:Organization) RETURN p.name, o.name LIMIT 10;'
+            print(f"\n✓ Executing relationship query...")
+            result = execute_graph_query(query)
+            if result:
+                print(f"Found relationships:")
+                print(result)
+            else:
+                print("(No relationships found or NebulaGraph not responding)")
+        except Exception as e:
+            print(f"(Query execution error: {str(e)[:50]}...)")
 
-def main():
-    """Main demonstration function"""
-    
-    # Sample unstructured text
-    unstructured_text = """
-    John Smith from Acme Corporation signed a major contract on December 14, 2024, 
-    valued at $5 million. The agreement was finalized in New York City and involves 
-    collaboration with Microsoft on AI research initiatives. 
-    
-    Sarah Johnson, CEO of TechVision Inc., also participated in the negotiations.
-    The project duration is 2 years and includes $1.2 million in Phase 1 funding.
-    """
-    
-    # Run the complete pipeline
-    pipeline = IntegratedPipeline()
-    results = pipeline.run_complete_pipeline(unstructured_text)
-    
-    # Print summary
-    print("\n" + "="*70)
-    print("PIPELINE EXECUTION COMPLETE")
-    print("="*70)
-    print("\nSummary:")
-    print(f"- Workflow Status: {results.get('workflow', {}).get('status', 'unknown')}")
-    print(f"- Entities Extracted: {len(results.get('workflow', {}).get('entities', []))}")
-    print(f"- Vector Documents Stored: {results.get('vector_storage', {}).get('stored_successfully', 0)}")
-    print(f"- Graph Entities Added: {results.get('graph_storage', {}).get('entities_added', 0)}")
-    print(f"- Graph Relationships Added: {results.get('graph_storage', {}).get('relationships_added', 0)}")
-
-if __name__ == "__main__":
-    main()

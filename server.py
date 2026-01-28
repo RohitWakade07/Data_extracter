@@ -1,28 +1,35 @@
 """
 Web server for document upload and processing
 Handles file uploads and runs the extraction pipeline
+Supports React frontend via CORS
 """
 
 from flask import Flask, render_template, request, jsonify
+from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import os
 import shutil
 from dotenv import load_dotenv
 from integration_demo.integrated_pipeline import IntegratedPipeline
+from knowledge_graph.nebula_handler import NebulaGraphClient
+from vector_database.weaviate_handler import WeaviateClient
 from utils.helpers import print_section
 import uuid
 
 load_dotenv()
 
 app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": ["http://localhost:5173", "http://localhost:5174", "http://localhost:8080", "http://localhost:5000", "http://127.0.0.1:5173", "http://127.0.0.1:5174"]}})
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 app.config['UPLOAD_FOLDER'] = 'uploads'
 
 # Create uploads folder if it doesn't exist
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# Initialize pipeline
+# Initialize pipeline and handlers
 pipeline = IntegratedPipeline()
+nebula_handler = NebulaGraphClient()
+weaviate_handler = WeaviateClient()
 
 ALLOWED_EXTENSIONS = {
     'txt', 'pdf', 'docx', 'doc',
@@ -87,13 +94,22 @@ def upload_file():
         vector_ids = results.get('vector_storage', {}).get('document_ids', [])
         vector_uuid = vector_ids[0] if vector_ids else 'N/A'
         
+        # Get graph storage results
+        graph_storage = results.get('graph_storage', {})
+        entities_added = graph_storage.get('entities_added', 0)
+        relationships_added = graph_storage.get('relationships_added', 0)
+        
+        # Debug output
+        print(f"DEBUG: entities_added={entities_added}, relationships_added={relationships_added}")
+        print(f"DEBUG: extracted_relationships={len(extracted_relationships)}")
+        
         return jsonify({
             'success': True,
             'filename': filename,
             'text_preview': text_content[:500] + '...' if len(text_content) > 500 else text_content,
             'results': {
-                'entities_count': results.get('graph_storage', {}).get('entities_added', 0),
-                'relationships_count': results.get('graph_storage', {}).get('relationships_added', 0),
+                'entities_count': entities_added,
+                'relationships_count': relationships_added,
                 'vector_document_uuid': vector_uuid,
                 'workflow_status': results.get('workflow', {}).get('status', 'unknown'),
                 'entities': extracted_entities,
@@ -293,6 +309,121 @@ def extract_text(filepath):
 def health_check():
     """Health check endpoint"""
     return jsonify({'status': 'ok', 'message': 'Server running'}), 200
+
+
+@app.route('/api/process', methods=['POST'])
+def process_text():
+    """Process text directly without file upload"""
+    try:
+        data = request.get_json()
+        if not data or 'text' not in data:
+            return jsonify({'success': False, 'error': 'No text provided'}), 400
+        
+        text_content = data['text'].strip()
+        if not text_content:
+            return jsonify({'success': False, 'error': 'Empty text provided'}), 400
+        
+        # Run pipeline
+        print_section("Processing text input")
+        results = pipeline.run_complete_pipeline(text_content)
+
+        extracted_entities = results.get('workflow', {}).get('entities', [])
+        extracted_relationships = results.get('relationships', [])
+        
+        # Get vector document UUID
+        vector_ids = results.get('vector_storage', {}).get('document_ids', [])
+        vector_uuid = vector_ids[0] if vector_ids else 'N/A'
+        
+        # Get graph storage results
+        graph_storage = results.get('graph_storage', {})
+        entities_added = graph_storage.get('entities_added', 0)
+        relationships_added = graph_storage.get('relationships_added', 0)
+        
+        return jsonify({
+            'success': True,
+            'text_preview': text_content[:500] + '...' if len(text_content) > 500 else text_content,
+            'results': {
+                'entities_count': entities_added,
+                'relationships_count': relationships_added,
+                'vector_document_uuid': vector_uuid,
+                'workflow_status': results.get('workflow', {}).get('status', 'unknown'),
+                'entities': extracted_entities,
+                'relationships': extracted_relationships,
+                'errors': results.get('workflow', {}).get('errors', [])
+            }
+        }), 200
+    
+    except Exception as e:
+        print(f"Error processing text: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/search', methods=['GET'])
+def semantic_search():
+    """Semantic search using Weaviate vector database"""
+    try:
+        query = request.args.get('q', '')
+        limit = int(request.args.get('limit', 10))
+        
+        if not query:
+            return jsonify({'success': False, 'error': 'No query provided'}), 400
+        
+        # Use the standalone weaviate handler to search
+        try:
+            results = weaviate_handler.semantic_search(query, limit=limit)
+            return jsonify({
+                'success': True,
+                'results': results
+            }), 200
+        except Exception as e:
+            print(f"Weaviate search error: {str(e)}")
+            return jsonify({'success': True, 'results': []}), 200
+    
+    except Exception as e:
+        print(f"Search error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/graph', methods=['GET'])
+def get_graph_data():
+    """Get entities and relationships from NebulaGraph"""
+    try:
+        # Use the standalone nebula handler to get graph data
+        try:
+            entities = nebula_handler.get_all_entities()
+            relationships = nebula_handler.get_all_relationships()
+            return jsonify({
+                'success': True,
+                'nodes': entities,
+                'edges': relationships
+            }), 200
+        except Exception as e:
+            print(f"NebulaGraph query error: {str(e)}")
+            return jsonify({'success': True, 'nodes': [], 'edges': []}), 200
+    
+    except Exception as e:
+        print(f"Graph data error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/graph/stats', methods=['GET'])
+def get_graph_stats():
+    """Get statistics from NebulaGraph"""
+    try:
+        try:
+            stats = nebula_handler.get_graph_stats()
+            return jsonify({
+                'success': True,
+                'stats': stats
+            }), 200
+        except Exception as e:
+            print(f"NebulaGraph stats error: {str(e)}")
+            return jsonify({'success': True, 'stats': {'entities': 0, 'relationships': 0}}), 200
+    
+    except Exception as e:
+        print(f"Stats error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 
 if __name__ == '__main__':
     print("Starting Data Extraction Frontend Server...")
