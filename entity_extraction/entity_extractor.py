@@ -40,6 +40,23 @@ class EntityExtractor:
                     print("Warning: google-genai not installed, falling back to langchain")
                     from langchain_google_genai import ChatGoogleGenerativeAI
                     return ChatGoogleGenerativeAI(model="gemini-1.0-pro", temperature=0)
+            elif self.llm_provider == "openrouter":
+                from utils.llm_handler import OpenRouterLLM
+                import os
+                from dotenv import load_dotenv
+                load_dotenv(os.path.join(os.path.dirname(__file__), '..', 'utils', '.env'))
+                api_key = os.getenv("data_extraction_LiquidAi_api_key")
+                if not api_key:
+                    raise ValueError("data_extraction_LiquidAi_api_key not found in utils/.env")
+                return OpenRouterLLM(api_key=api_key)
+            elif self.llm_provider == "ollama":
+                from utils.ollama_handler import OllamaLLM
+                import os
+                from dotenv import load_dotenv
+                load_dotenv(os.path.join(os.path.dirname(__file__), '..', 'utils', '.env'))
+                model = os.getenv("OLLAMA_MODEL", "llama3")
+                api_key = os.getenv("OLLAMA_API_KEY", "")
+                return OllamaLLM(api_key=api_key, model=model)
             else:
                 raise ValueError(f"Unsupported LLM provider: {self.llm_provider}")
         except Exception as e:
@@ -57,22 +74,29 @@ class EntityExtractor:
         Returns:
             ExtractionResult containing extracted entities
         """
-        # Token-efficient prompt
-        prompt = f"""Extract ONLY actual entities from text. Return JSON array only.
+        # Token-efficient prompt — tuned for llama3
+        prompt = f"""You are a precise Named Entity Recognition (NER) system. Extract ALL entities from the text below.
 
-Rules:
-- PERSON: Real people's names (FirstName LastName). NO business terms, NO locations, NO descriptions.
-- ORGANIZATION: Company/Corp/Bank/Foundation names (with Corp/Inc/LLC/etc or proper company name).
-- DATE: Specific dates in any format.
-- AMOUNT: Money with currency ($, INR, Rs, USD) or numbers.
-- LOCATION: Cities, states, countries, geographic places.
-- PROJECT: Project names, initiatives, or specific work engagements.
-- INVOICE: Invoice numbers or identifiers.
-- AGREEMENT: Contracts, agreements, proposals, or legal documents.
+IMPORTANT: You MUST find EVERY person, organization, location, date, amount, project, invoice, and agreement mentioned in the text. Do NOT skip any.
 
-TEXT: {text}
+Return a JSON array where each item has: "type", "value", "confidence"
 
-Return only valid entities as JSON array. NO phrases like "Quarterly Business", "Performance Report", or "Business Street" as Person."""
+Types:
+- PERSON: Every person's full name (e.g. "Rahul Deshmukh", "Vikram Joshi")
+- ORGANIZATION: Every company, firm, bank, government body (e.g. "Meridian Infrastructure Solutions Pvt. Ltd.", "HDFC Bank", "Deloitte India", "Pune Municipal Corporation", "GreenTech Engineering Services LLP", "Sharma Legal Associates")
+- DATE: Every date mentioned (e.g. "January 15, 2025")
+- AMOUNT: Every monetary value (e.g. "INR 45 crore")
+- LOCATION: Every city, state, country, area (e.g. "Pune", "Maharashtra", "Karnataka")
+- PROJECT: Every named project or initiative
+- INVOICE: Every invoice number
+- AGREEMENT: Every contract, agreement, or proposal name
+
+CRITICAL: Look carefully for ALL organizations including banks, law firms, government bodies, and consulting firms. Look for ALL people mentioned anywhere in the text.
+
+TEXT:
+{text}
+
+Output ONLY a JSON array, nothing else:"""
         
         # If LLM is not available, use fallback directly
         if not self.llm:
@@ -87,7 +111,10 @@ Return only valid entities as JSON array. NO phrases like "Quarterly Business", 
 
             llm: Any = self.llm
             models = getattr(llm, "models", None)
-            if self.llm_provider == "gemini" and models is not None and hasattr(models, "generate_content"):
+            if self.llm_provider in ("openrouter", "ollama") and hasattr(llm, "chat"):
+                # OpenRouter or Ollama LLM handler
+                raw_response = llm.chat(prompt)
+            elif self.llm_provider == "gemini" and models is not None and hasattr(models, "generate_content"):
                 # Direct Google GenAI API client
                 response = models.generate_content(
                     model="gemini-1.5-flash",
@@ -105,21 +132,30 @@ Return only valid entities as JSON array. NO phrases like "Quarterly Business", 
             entities = self._parse_entities(raw_response)
             entities = self._validate_entities(entities)
 
-            # Supplement LLM extraction with regex-based entities to maximize recall.
-            # This helps when the LLM misses domain-specific patterns (invoice IDs, INR amounts, etc.).
-            regex_entities = self._regex_extract(text)
-            if regex_entities:
-                merged: Dict[tuple[str, str], Entity] = {}
-                for ent in (entities or []):
-                    merged[(ent.type.lower(), ent.value.strip().lower())] = ent
-                for ent in regex_entities:
-                    key = (ent.type.lower(), ent.value.strip().lower())
-                    if key not in merged:
-                        merged[key] = ent
-                    else:
-                        # Keep the higher confidence score
-                        merged[key].confidence = max(merged[key].confidence, ent.confidence)
-                entities = list(merged.values())
+            # Use regex ONLY as fallback when LLM returns no entities
+            if not entities:
+                print("LLM returned no entities, falling back to regex extraction")
+                entities = self._regex_extract(text)
+            else:
+                # Supplement LLM results with regex for missed entities
+                # LLM is primary; regex fills gaps for critical types (person, org, location)
+                regex_entities = self._regex_extract(text)
+                llm_values_lower = {e.value.lower().strip() for e in entities}
+                supplemented = 0
+                for re_ent in regex_entities:
+                    val_lower = re_ent.value.lower().strip()
+                    if val_lower not in llm_values_lower:
+                        # Always supplement person/organization/location — these are critical
+                        # For other types, only add if LLM missed the type entirely
+                        critical_types = {'person', 'organization', 'location'}
+                        llm_types = {e.type.lower() for e in entities}
+                        if re_ent.type.lower() in critical_types or re_ent.type.lower() not in llm_types:
+                            re_ent = Entity(type=re_ent.type, value=re_ent.value, confidence=re_ent.confidence * 0.8)
+                            entities.append(re_ent)
+                            llm_values_lower.add(val_lower)
+                            supplemented += 1
+                if supplemented:
+                    print(f"Supplemented {supplemented} entities from regex fallback")
             
             if entities:
                 return ExtractionResult(
@@ -134,133 +170,165 @@ Return only valid entities as JSON array. NO phrases like "Quarterly Business", 
         return self._fallback_extract(text)
     
     def _parse_entities(self, response: str) -> List[Entity]:
-        """Parse LLM response into Entity objects"""
+        """Parse LLM response into Entity objects, handling multiple JSON formats"""
         try:
+            # Strip markdown code fences if present
+            cleaned = response.strip()
+            if cleaned.startswith('```'):
+                # Remove ```json ... ``` wrapper
+                lines = cleaned.split('\n')
+                lines = [l for l in lines if not l.strip().startswith('```')]
+                cleaned = '\n'.join(lines)
+            
             # Try to extract JSON from response
-            json_start = response.find('[')
-            json_end = response.rfind(']') + 1
+            json_start = cleaned.find('[')
+            json_end = cleaned.rfind(']') + 1
             
             if json_start != -1 and json_end > json_start:
-                json_str = response[json_start:json_end]
+                json_str = cleaned[json_start:json_end]
                 data = json.loads(json_str)
                 
                 entities = []
                 for item in data:
-                    entity = Entity(
-                        type=item.get('type', 'unknown'),
-                        value=item.get('value', ''),
-                        confidence=item.get('confidence', 1.0)
-                    )
-                    entities.append(entity)
+                    if 'type' in item and 'value' in item:
+                        # Standard format: {"type": "PERSON", "value": "John"}
+                        raw_type = item.get('type', 'unknown').lower()
+                        # Normalize synonymous types
+                        type_normalize = {
+                            'state': 'location', 'country': 'location', 'region': 'location',
+                            'city': 'location', 'place': 'location', 'area': 'location',
+                            'company': 'organization', 'org': 'organization', 'firm': 'organization',
+                            'bank': 'organization', 'institution': 'organization',
+                            'name': 'person', 'individual': 'person',
+                            'money': 'amount', 'currency': 'amount', 'cost': 'amount',
+                            'contract': 'agreement', 'proposal': 'agreement',
+                        }
+                        normalized_type = type_normalize.get(raw_type, raw_type)
+                        entity = Entity(
+                            type=normalized_type,
+                            value=item.get('value', ''),
+                            confidence=float(item.get('confidence', 0.9))
+                        )
+                        if entity.value:
+                            entities.append(entity)
+                    else:
+                        # Alternative format: {"Person": "John", "Organization": "Acme"}
+                        type_map = {
+                            'person': 'person', 'name': 'person', 'individual': 'person',
+                            'organization': 'organization', 'company': 'organization', 'org': 'organization',
+                            'firm': 'organization', 'bank': 'organization', 'institution': 'organization',
+                            'date': 'date', 'amount': 'amount', 'money': 'amount', 'cost': 'amount',
+                            'location': 'location', 'place': 'location', 'city': 'location',
+                            'state': 'location', 'country': 'location', 'region': 'location', 'area': 'location',
+                            'project': 'project', 'invoice': 'invoice',
+                            'agreement': 'agreement', 'contract': 'agreement', 'proposal': 'agreement',
+                        }
+                        for key, value in item.items():
+                            mapped_type = type_map.get(key.lower())
+                            if mapped_type and value:
+                                # Value could be a string or list
+                                values = value if isinstance(value, list) else [value]
+                                for v in values:
+                                    if isinstance(v, str) and v.strip():
+                                        entities.append(Entity(
+                                            type=mapped_type,
+                                            value=v.strip(),
+                                            confidence=0.9
+                                        ))
                 return entities
             return []
-        except:
+        except Exception as e:
+            print(f"Warning: JSON parse failed: {str(e)[:60]}")
             return []
     
     def _validate_entities(self, entities: List[Entity]) -> List[Entity]:
         """
-        Validate extracted entities to remove misclassifications
-        
+        Validate and re-classify extracted entities using the Domain Schema.
+
+        Pipeline layers applied here:
+          Step 2 – Type Identification (reclassify mistyped entities)
+          Step 6 – Confidence Scoring (per-entity confidence adjustment)
+
         Filters out:
         - Words commonly misclassified as Person (business terms, descriptions)
         - Street names classified as Person
         - Organization names classified as Person
         """
         import re
-        
-        # Words/patterns that should NOT be Person
-        non_person_patterns = [
-            # Business/document terms
-            r'(?i)(quarterly|performance|report|business|street|report|document|agreement|contract|terms)',
-            # Organization keywords
-            r'(?i)(corp|corporation|inc|ltd|llc|group|bank|foundation|university|institute|solutions|agency|department)',
-            # Multi-word phrases with articles or prepositions
-            r'\b(of|and|the|or|in|on|at)\b',
-        ]
-        
-        # Street/location indicators that shouldn't be Person
-        location_indicators = ['street', 'avenue', 'boulevard', 'road', 'drive', 'plaza', 'square', 'lane', 'court']
-        
+        from utils.domain_schema import identify_entity_type, ORG_INDICATORS, LOCATION_INDICATORS as LOC_IND
+
         validated = []
         for entity in entities:
             skip = False
             confidence = entity.confidence
-            
-            # Validate person: should be "FirstName LastName" format
+
+            # ── Step 2: Type Identification via domain schema ──────────
+            corrected_type = identify_entity_type(entity.value, entity.type.lower())
+            if corrected_type != entity.type.lower():
+                # Reclassify — keep value, change type, slight confidence penalty
+                entity = Entity(
+                    type=corrected_type,
+                    value=entity.value,
+                    confidence=max(0.60, confidence - 0.10),
+                )
+                confidence = entity.confidence
+
+            # ── Step 6: Confidence adjustments per type ────────────────
             if entity.type.lower() == 'person':
-                # Check against non-person patterns
+                # Check obvious non-person patterns
+                non_person_patterns = [
+                    r'(?i)(quarterly|performance|report|business|document|agreement|contract|terms)',
+                    r'\b(of|and|the|or|in|on|at)\b',
+                ]
                 for pattern in non_person_patterns:
                     if re.search(pattern, entity.value):
                         skip = True
                         break
-                
-                # Check for location indicators
-                if any(indicator in entity.value.lower() for indicator in location_indicators):
-                    skip = True
-                
-                # Person should have 2-3 words, no articles/prepositions as main part
+
                 words = entity.value.split()
-                if len(words) > 4:  # Too many words for a person name
+                if len(words) > 4:
                     skip = True
                 elif len(words) == 2:
-                    # Boost confidence for two-word names (typical person name format)
                     confidence = min(0.95, confidence + 0.05)
-                
-                # Single word that's capitalized could be location or org
-                if len(words) == 1 and entity.value[0].isupper():
-                    # Check if it looks like org or location
-                    if any(org_keyword in entity.value.lower() for org_keyword in 
-                           ['corp', 'inc', 'ltd', 'bank', 'foundation', 'university', 'institute']):
-                        skip = True
-                
-                # Reduce confidence for single-word names
-                if len(words) == 1:
+                if not skip and len(words) == 1:
                     confidence = max(0.3, confidence - 0.3)
-            
-            # Validate organization: should have Corp/Inc/LLC or be known company
+
             elif entity.type.lower() == 'organization':
-                # Organizations typically have Corp/Inc/LLC or are proper names
-                has_org_suffix = any(suffix in entity.value for suffix in 
-                                    ['Corp', 'Inc', 'Ltd', 'LLC', 'Company', 'Group', 'Bank', 'Foundation', 'University'])
-                
+                has_org_suffix = any(suffix in entity.value for suffix in
+                                    ['Corp', 'Inc', 'Ltd', 'LLC', 'Company', 'Group', 'Bank',
+                                     'Foundation', 'University', 'LLP', 'Services', 'Solutions',
+                                     'Associates', 'Municipal Corporation'])
                 words = entity.value.split()
-                
-                # Single word organization without suffix is less likely
                 if len(words) == 1 and not has_org_suffix:
                     confidence = max(0.5, confidence - 0.2)
-                else:
-                    # Boost confidence for multi-word orgs with proper structure
-                    if has_org_suffix:
-                        confidence = min(0.95, confidence + 0.1)
-            
-            # Validate dates
+                elif has_org_suffix:
+                    confidence = min(0.95, confidence + 0.1)
+
+            elif entity.type.lower() == 'location':
+                # Locations are generally fine; boost named places
+                confidence = min(0.95, confidence + 0.02)
+
             elif entity.type.lower() == 'date':
-                # Check date format (should match patterns like YYYY-MM-DD, Month DD, YYYY, etc)
                 date_patterns = [
-                    r'\d{4}-\d{2}-\d{2}',  # YYYY-MM-DD
-                    r'\d{1,2}/\d{1,2}/\d{4}',  # MM/DD/YYYY
+                    r'\d{4}-\d{2}-\d{2}',
+                    r'\d{1,2}/\d{1,2}/\d{4}',
                     r'(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}',
-                    r'\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}'
                 ]
-                if any(re.search(pattern, entity.value, re.IGNORECASE) for pattern in date_patterns):
+                if any(re.search(p, entity.value, re.IGNORECASE) for p in date_patterns):
                     confidence = min(0.98, confidence + 0.05)
-            
-            # Validate amounts
+
             elif entity.type.lower() == 'amount':
-                if re.search(r'\$[\d,]+', entity.value):
+                if re.search(r'(?:\$|INR|Rs)', entity.value, re.IGNORECASE):
                     confidence = min(0.98, confidence + 0.05)
-            
-            # Validate new types
+
             elif entity.type.lower() in ['project', 'invoice', 'agreement']:
-                # Basic validation: ensure not empty and reasonable length
                 if len(entity.value) > 2:
                     confidence = min(0.95, confidence + 0.05)
-            
+
             if not skip:
-                # Update confidence
                 entity.confidence = confidence
                 validated.append(entity)
-        
+
         return validated
     
     def _regex_extract(self, text: str) -> List[Entity]:
@@ -289,7 +357,9 @@ Return only valid entities as JSON array. NO phrases like "Quarterly Business", 
         # Helper to clean person names - remove trailing common words
         def clean_person_name(name: str) -> str:
             """Remove trailing common words that get accidentally captured in names"""
-            trailing_words = ['and', 'to', 'of', 'the', 'for', 'with', 'in', 'at', 'by', 'from', 'on', 'is', 'was', 'has', 'have', 'who', 'that', 'which']
+            trailing_words = ['and', 'to', 'of', 'the', 'for', 'with', 'in', 'at', 'by', 'from', 'on', 'is', 'was', 'has', 'have', 'who', 'that', 'which',
+                              'representing', 'overseeing', 'coordinating', 'managing', 'leading', 'heading', 'reviewing',
+                              'confirmed', 'submitted', 'signed', 'partner', 'senior', 'legal', 'review']
             words = name.strip().split()
             # Remove trailing common words
             while words and words[-1].lower() in trailing_words:
@@ -326,6 +396,15 @@ Return only valid entities as JSON array. NO phrases like "Quarterly Business", 
                     add("person", cleaned_name, 0.90)
 
         # Generic two/three-token names (kept conservative by filtering obvious non-names)
+        # Pre-define known companies for cross-check (full list used later in org extraction)
+        known_companies = [
+            "Mahindra", "Tata", "Reliance", "Infosys", "Wipro", "TCS", "HCL", "Tech Mahindra",
+            "Bajaj", "Birla", "Adani", "HDFC", "ICICI", "SBI", "Kotak", "Axis",
+            "Amazon", "Google", "Microsoft", "Apple", "Meta", "Facebook", "IBM", "Oracle",
+            "Accenture", "Deloitte", "PwC", "EY", "KPMG", "McKinsey", "BCG", "Bain",
+            "Cognizant", "Capgemini", "L&T", "Larsen & Toubro", "Godrej", "ITC", "Hindustan Unilever",
+        ]
+        known_company_words = {c.lower() for c in known_companies}
         for m in re.finditer(r"\b([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b", text):
             candidate = m.group(1)
             lower = candidate.lower()
@@ -337,9 +416,17 @@ Return only valid entities as JSON array. NO phrases like "Quarterly Business", 
             if any(tok in lower for tok in [
                 "infrastructure", "solutions", "engineering", "services", "corporation", "company",
                 "municipal", "department", "office", "park", "initiative", "agreement", "invoice",
+                "associates", "partners", "consulting", "consultants", "legal",
+                "center", "centre", "civic", "plaza", "tower", "building", "hall",
+                "bank", "insurance", "finance", "capital", "ventures", "foundation", "trust",
+                "industries", "enterprises", "technologies", "holdings",
             ]):
                 continue
             if re.search(month, candidate, re.IGNORECASE):
+                continue
+            # Skip if any word is a known company name (e.g. "Deloitte India")
+            candidate_words = {w.lower() for w in candidate.split()}
+            if candidate_words & known_company_words:
                 continue
             # Clean the candidate name
             cleaned_candidate = clean_person_name(candidate)
@@ -489,7 +576,17 @@ Return only valid entities as JSON array. NO phrases like "Quarterly Business", 
             if second.lower() in indian_states and first.lower() not in indian_states:
                 add("location", f"{m.group(1)}, {m.group(2)}", 0.88)
 
-        return list(collected.values())
+        # ── Final pass: Apply domain-schema type reclassification ──────
+        from utils.domain_schema import identify_entity_type
+        final_entities: list[Entity] = []
+        for ent in collected.values():
+            corrected = identify_entity_type(ent.value, ent.type.lower())
+            if corrected != ent.type.lower():
+                ent = Entity(type=corrected, value=ent.value,
+                             confidence=max(0.55, ent.confidence - 0.10))
+            final_entities.append(ent)
+
+        return final_entities
 
     def _fallback_extract(self, text: str) -> ExtractionResult:
         """Rule-based extraction when LLM fails (regex-based)."""
@@ -504,8 +601,10 @@ Return only valid entities as JSON array. NO phrases like "Quarterly Business", 
 def extract_from_text(text: str, provider: str | None = None) -> ExtractionResult:
     """Convenience function to extract entities"""
     import os
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), '..', 'utils', '.env'))
     if provider is None:
-        provider = os.getenv("LLM_PROVIDER", "gemini")
+        provider = os.getenv("LLM_PROVIDER", "ollama")
     extractor = EntityExtractor(llm_provider=provider)
     return extractor.extract_entities(text)
 
