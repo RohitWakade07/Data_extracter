@@ -308,9 +308,11 @@ class IntegratedPipeline:
             try:
                 from knowledge_graph.nebula_handler import execute_graph_query
                 person_name = persons[0].get("value", "")
-                person_id = f'"{person_name}"'
+                # Build entity ID like the storage uses
+                person_id = f'person_{person_name.replace(" ", "_")}'
                 
-                query = f'FETCH PROP ON Person {person_id};'
+                # NebulaGraph 3.x requires YIELD clause in FETCH
+                query = f'FETCH PROP ON Person "{person_id}" YIELD properties(vertex) AS props;'
                 print(f"Query: Fetch all properties of person: {person_name}")
                 print("Expected: Return person node with all attributes")
                 
@@ -336,7 +338,8 @@ class IntegratedPipeline:
             from knowledge_graph.nebula_handler import execute_graph_query
             
             # Find all person->works_at->organization relationships
-            query = 'MATCH (p:Person)-[e:WORKS_AT]->(o:Organization) RETURN p.name, o.name LIMIT 10;'
+            # In NebulaGraph 3.x, use tag-qualified property access: p.Person.name
+            query = 'MATCH (p:Person)-[e:WORKS_AT]->(o:Organization) RETURN p.Person.name AS person, o.Organization.name AS org LIMIT 10;'
             print(f"\n✓ Executing relationship query...")
             result = execute_graph_query(query)
             if result:

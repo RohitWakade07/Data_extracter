@@ -5,7 +5,9 @@ import json
 import time
 
 # Entity type mapping for consistent tagging
+# Extended with supply chain, incident, and event types
 ENTITY_TAG_MAP = {
+    # Core entities
     "person": "Person",
     "organization": "Organization",
     "amount": "Amount",
@@ -13,11 +15,34 @@ ENTITY_TAG_MAP = {
     "location": "Location",
     "project": "Project",
     "invoice": "Invoice",
-    "agreement": "Agreement"
+    "agreement": "Agreement",
+    
+    # Supply chain entities
+    "shipment": "Shipment",
+    "port": "Port",
+    "supplier": "Supplier",
+    "customer": "Customer",
+    "warehouse": "Warehouse",
+    "logistics_partner": "LogisticsPartner",
+    "cargo": "Cargo",
+    
+    # Event & Incident entities
+    "event": "Event",
+    "incident": "Incident",
+    "delay": "Delay",
+    "congestion": "Congestion",
+    "weather_event": "WeatherEvent",
+    "disruption": "Disruption",
+    
+    # Additional entities
+    "product": "Product",
+    "category": "Category",
+    "route": "Route"
 }
 
-# Relationship mapping rules
+# Relationship mapping rules - Extended for supply chain intelligence
 RELATIONSHIP_MAP = {
+    # Existing relationships
     ("Person", "Organization"): "WORKS_AT",
     ("Person", "Location"): "LOCATED_IN",
     ("Person", "Date"): "SIGNED_ON",
@@ -34,6 +59,36 @@ RELATIONSHIP_MAP = {
     ("Invoice", "Amount"): "HAS_AMOUNT",
     ("Invoice", "Date"): "DUE_ON",
     ("Project", "Location"): "LOCATED_IN",
+    
+    # Supply chain relationships
+    ("Organization", "Shipment"): "SENT",
+    ("Shipment", "Organization"): "RECEIVED_BY",
+    ("Shipment", "Location"): "LOCATED_AT",
+    ("Shipment", "Port"): "ROUTED_THROUGH",
+    ("Organization", "Supplier"): "SUPPLIED_BY",
+    ("Organization", "Customer"): "SELLS_TO",
+    ("Organization", "LogisticsPartner"): "USES_LOGISTICS",
+    ("Supplier", "Organization"): "SUPPLIES_TO",
+    ("Shipment", "Delay"): "EXPERIENCED",
+    ("Delay", "WeatherEvent"): "CAUSED_BY",
+    ("Delay", "Congestion"): "CAUSED_BY",
+    ("Port", "Congestion"): "HAS",
+    ("Organization", "Port"): "OPERATES_AT",
+    ("Warehouse", "Location"): "LOCATED_AT",
+    ("Cargo", "Shipment"): "PART_OF",
+    ("Route", "Port"): "PASSES_THROUGH",
+    
+    # Incident relationships
+    ("Incident", "Organization"): "AFFECTED",
+    ("Incident", "Category"): "BELONGS_TO",
+    ("Event", "Location"): "OCCURRED_AT",
+    ("Event", "Organization"): "IMPACTED",
+    ("Disruption", "Organization"): "DISRUPTED",
+    ("WeatherEvent", "Location"): "OCCURRED_AT",
+    ("Congestion", "Port"): "AFFECTED",
+    
+    # Generic fallback
+    ("Entity", "Entity"): "RELATED_TO"
 }
 
 
@@ -165,6 +220,130 @@ class NebulaGraphClient:
                 )
             """)
 
+            # ----------------- SUPPLY CHAIN TAGS -----------------
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Shipment(
+                    name string,
+                    status string,
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Port(
+                    name string,
+                    country string,
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Supplier(
+                    name string,
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Customer(
+                    name string,
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE TAG IF NOT EXISTS LogisticsPartner(
+                    name string,
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Warehouse(
+                    name string,
+                    capacity string,
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Cargo(
+                    name string,
+                    type string,
+                    confidence float
+                )
+            """)
+
+            # ----------------- EVENT/INCIDENT TAGS -----------------
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Event(
+                    name string,
+                    type string,
+                    severity string,
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Incident(
+                    name string,
+                    category string,
+                    severity string,
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Delay(
+                    name string,
+                    duration string,
+                    cause string,
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Congestion(
+                    name string,
+                    severity string,
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE TAG IF NOT EXISTS WeatherEvent(
+                    name string,
+                    type string,
+                    severity string,
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Disruption(
+                    name string,
+                    type string,
+                    impact string,
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Category(
+                    name string,
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Route(
+                    name string,
+                    origin string,
+                    destination string,
+                    confidence float
+                )
+            """)
+
             # ----------------- EDGES -----------------
             session.execute("""
                 CREATE EDGE IF NOT EXISTS WORKS_AT(
@@ -174,6 +353,12 @@ class NebulaGraphClient:
 
             session.execute("""
                 CREATE EDGE IF NOT EXISTS LOCATED_IN(
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS LOCATED_AT(
                     confidence float
                 )
             """)
@@ -238,20 +423,146 @@ class NebulaGraphClient:
                 )
             """)
 
+            # ----------------- SUPPLY CHAIN EDGES -----------------
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS SENT(
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS RECEIVED_BY(
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS ROUTED_THROUGH(
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS SUPPLIED_BY(
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS SUPPLIES_TO(
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS SELLS_TO(
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS USES_LOGISTICS(
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS OPERATES_AT(
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS PASSES_THROUGH(
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS PART_OF(
+                    confidence float
+                )
+            """)
+
+            # ----------------- EVENT/INCIDENT EDGES -----------------
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS EXPERIENCED(
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS CAUSED_BY(
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS HAS(
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS AFFECTED(
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS IMPACTED(
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS DISRUPTED(
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS BELONGS_TO(
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS OCCURRED_AT(
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE EDGE IF NOT EXISTS RELATED_TO(
+                    confidence float
+                )
+            """)
+
             print("Graph schema created successfully. Creating indexes for MATCH queries...")
             time.sleep(3)  # Wait for schema to propagate
             
-            # Create tag indexes for LOOKUP queries to work
-            tag_types = ['Person', 'Organization', 'Location', 'Project', 'Invoice', 'Agreement', 'Amount', 'Date']
+            # Create tag indexes for LOOKUP queries to work - Extended list
+            tag_types = [
+                'Person', 'Organization', 'Location', 'Project', 'Invoice', 'Agreement', 'Amount', 'Date',
+                'Shipment', 'Port', 'Supplier', 'Customer', 'LogisticsPartner', 'Warehouse', 'Cargo',
+                'Event', 'Incident', 'Delay', 'Congestion', 'WeatherEvent', 'Disruption', 'Category', 'Route'
+            ]
             for tag in tag_types:
                 try:
                     session.execute(f"CREATE TAG INDEX IF NOT EXISTS idx_{tag.lower()} ON `{tag}`()")
                 except Exception as idx_err:
                     print(f"Index creation for {tag} skipped: {idx_err}")
             
-            # Create edge indexes for ALL edge types
-            edge_types = ['WORKS_AT', 'LOCATED_IN', 'WORKS_ON', 'MANAGES', 'PARTY_TO', 
-                          'SIGNED_ON', 'HAS_AMOUNT', 'EFFECTIVE_ON', 'HAS_VALUE', 'ISSUED', 'DUE_ON', 'BILLED_TO']
+            # Create edge indexes for ALL edge types - Extended list
+            edge_types = [
+                'WORKS_AT', 'LOCATED_IN', 'LOCATED_AT', 'WORKS_ON', 'MANAGES', 'PARTY_TO', 
+                'SIGNED_ON', 'HAS_AMOUNT', 'EFFECTIVE_ON', 'HAS_VALUE', 'ISSUED', 'DUE_ON', 'BILLED_TO',
+                'SENT', 'RECEIVED_BY', 'ROUTED_THROUGH', 'SUPPLIED_BY', 'SUPPLIES_TO', 'SELLS_TO',
+                'USES_LOGISTICS', 'OPERATES_AT', 'PASSES_THROUGH', 'PART_OF',
+                'EXPERIENCED', 'CAUSED_BY', 'HAS', 'AFFECTED', 'IMPACTED', 'DISRUPTED', 'BELONGS_TO',
+                'OCCURRED_AT', 'RELATED_TO'
+            ]
             for edge in edge_types:
                 try:
                     session.execute(f"CREATE EDGE INDEX IF NOT EXISTS idx_{edge.lower()} ON `{edge}`()")
@@ -293,7 +604,8 @@ class NebulaGraphClient:
         entity_id: str,
         entity_type: str,
         entity_value: str,
-        confidence: float = 1.0
+        confidence: float = 1.0,
+        extra_props: Dict[str, Any] = None
     ) -> bool:
         """Add entity node with standardized tagging"""
         session = self._get_session()
@@ -308,8 +620,10 @@ class NebulaGraphClient:
             
             # Clean entity value: remove newlines and strip whitespace
             clean_value = entity_value.replace("\n", " ").strip()
+            # Escape quotes for nGQL
+            clean_value = clean_value.replace('"', '\\"')
 
-            # Handle different tag schemas
+            # Handle different tag schemas based on tag type
             if tag in ["Date", "Amount"]:
                 query = (
                     f'INSERT VERTEX `{tag}`(value, confidence) '
@@ -341,7 +655,9 @@ class NebulaGraphClient:
         relationship_type: Optional[str] = None,
         confidence: float = 1.0
     ) -> bool:
-        """Add relationship edge with intelligent type mapping"""
+        """Add relationship edge with intelligent type mapping and retry logic"""
+        import time
+        
         session = self._get_session()
         if not session:
             return False
@@ -368,15 +684,29 @@ class NebulaGraphClient:
                 f'VALUES "{from_id}"->"{to_id}":({confidence})'
             )
             
-            result = session.execute(query)
-            
-            if not result.is_succeeded():
+            # Retry logic for atomic operation failures
+            max_retries = 3
+            for attempt in range(max_retries):
+                result = session.execute(query)
+                
+                if result.is_succeeded():
+                    print(f"Added relationship {from_id} -[{edge}]-> {to_id}")
+                    return True
+                
+                error_msg = result.error_msg()
+                
+                # Check if it's an atomic operation failure (race condition)
+                if "Atomic operation failed" in error_msg:
+                    if attempt < max_retries - 1:
+                        time.sleep(0.1 * (attempt + 1))  # Exponential backoff
+                        continue
+                
+                # Other errors or final attempt failed
                 print(f"Edge insert error: {from_id} -[{edge}]-> {to_id}")
-                print(f"   Error: {result.error_msg()}")
+                print(f"   Error: {error_msg}")
                 return False
-
-            print(f"Added relationship {from_id} -[{edge}]-> {to_id}")
-            return True
+            
+            return False
 
         except Exception as e:
             print(f"Edge insert error for {from_id} -[{relationship_type}]-> {to_id}: {e}")
@@ -553,6 +883,7 @@ def store_in_nebula(
     host: str = "127.0.0.1",
     port: int = 9669
 ) -> Dict[str, Any]:
+    import time
 
     print("\n== STORING DATA IN NEBULAGRAPH")
     print("-" * 50)
@@ -587,8 +918,12 @@ def store_in_nebula(
         else:
             results["failed_operations"].append({"entity": e})
 
-    # Insert relationships
-    for r in relationships:
+    # Small delay after entities to let indexes settle
+    time.sleep(0.5)
+
+    # Insert relationships in smaller batches with delays to avoid atomic conflicts
+    batch_size = 10
+    for i, r in enumerate(relationships):
         ok = client.add_relationship(
             r["from_id"],
             r["to_id"],
@@ -602,6 +937,10 @@ def store_in_nebula(
             results["relationships_added"] += 1
         else:
             results["failed_operations"].append({"relationship": r})
+        
+        # Small delay every batch to reduce atomic conflicts
+        if (i + 1) % batch_size == 0:
+            time.sleep(0.05)
 
     print("NebulaGraph storage completed")
     return results

@@ -286,14 +286,44 @@ Return only valid entities as JSON array. NO phrases like "Quarterly Business", 
 
         month = r"(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)"
 
+        # Helper to clean person names - remove trailing common words
+        def clean_person_name(name: str) -> str:
+            """Remove trailing common words that get accidentally captured in names"""
+            trailing_words = ['and', 'to', 'of', 'the', 'for', 'with', 'in', 'at', 'by', 'from', 'on', 'is', 'was', 'has', 'have', 'who', 'that', 'which']
+            words = name.strip().split()
+            # Remove trailing common words
+            while words and words[-1].lower() in trailing_words:
+                words.pop()
+            # Remove leading common words too
+            while words and words[0].lower() in trailing_words:
+                words.pop(0)
+            return ' '.join(words)
+
         # -------------------- PERSON --------------------
         # Role/title anchored names: "project lead Rahul Deshmukh", "advocate Anjali Patil"
         role_name_patterns = [
-            r"(?i)\b(?:project\s+lead|operations\s+manager|advocate|mr\.?|ms\.?|mrs\.?|dr\.?|cfo|ceo)\s+([A-Z][a-z]+\s+[A-Z][a-z]+)\b",
+            r"(?i)\b(?:project\s+lead|operations\s+manager|advocate|mr\.?|ms\.?|mrs\.?|dr\.?|cfo|ceo|cto|coo|cmo|vp|director|manager|head|lead|senior|junior|associate|consultant|analyst|engineer|developer|designer|architect|executive|officer|coordinator|administrator|supervisor|specialist)\s+([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b",
+            # Names followed by role: "Rahul Deshmukh, Project Lead"
+            r"\b([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s*[,–-]\s*(?:project\s+lead|operations\s+manager|cfo|ceo|cto|coo|director|manager|head|lead|consultant|analyst|engineer|developer|designer|architect)\b",
+            # Names with designation: "Rahul Deshmukh (Lead)", "Anjali Patil - Manager"
+            r"\b([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s*(?:\(|–|-)\s*(?:Lead|Manager|Director|CEO|CTO|CFO|Head|Senior|Junior|Consultant|Analyst)\b",
         ]
         for pat in role_name_patterns:
             for m in re.finditer(pat, text):
-                add("person", m.group(1), 0.92)
+                cleaned_name = clean_person_name(m.group(1))
+                if cleaned_name and len(cleaned_name.split()) >= 2:  # Must have at least 2 words
+                    add("person", cleaned_name, 0.92)
+        
+        # Employee/works patterns: "works at", "employed at", "working for"
+        employee_patterns = [
+            r"\b([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:works|working|employed|serves|served)\s+(?:at|for|with|in)\b",
+            r"(?i)\b(?:employee|staff|team member|associate)\s+([A-Z][a-z]+\s+[A-Z][a-z]+)\b",
+        ]
+        for pat in employee_patterns:
+            for m in re.finditer(pat, text):
+                cleaned_name = clean_person_name(m.group(1))
+                if cleaned_name and len(cleaned_name.split()) >= 2:
+                    add("person", cleaned_name, 0.90)
 
         # Generic two/three-token names (kept conservative by filtering obvious non-names)
         for m in re.finditer(r"\b([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b", text):
@@ -311,11 +341,14 @@ Return only valid entities as JSON array. NO phrases like "Quarterly Business", 
                 continue
             if re.search(month, candidate, re.IGNORECASE):
                 continue
-            add("person", candidate, 0.80)
+            # Clean the candidate name
+            cleaned_candidate = clean_person_name(candidate)
+            if cleaned_candidate and len(cleaned_candidate.split()) >= 2:
+                add("person", cleaned_candidate, 0.80)
 
         # -------------------- ORGANIZATION --------------------
         # Common Indian/company suffixes
-        org_suffix = r"(?:Pvt\.?\s*Ltd\.?|Private\s+Limited|Ltd\.?|Limited|LLP|Inc\.?|Corp\.?|Corporation|Company|Co\.?|Group|Services|Engineering\s+Services|Solutions|Municipal\s+Corporation)"
+        org_suffix = r"(?:Pvt\.?\s*Ltd\.?|Private\s+Limited|Ltd\.?|Limited|LLP|Inc\.?|Corp\.?|Corporation|Company|Co\.?|Group|Services|Engineering\s+Services|Solutions|Municipal\s+Corporation|Industries|Enterprises|Technologies|Tech|Systems|Holdings|Partners|Associates|Foundation|Trust|Bank|Insurance|Finance|Consulting|Consultants|Advisory|Capital|Ventures|Labs|Studio|Agency|Media)"
 
         # Multi-word orgs ending with suffix
         for m in re.finditer(rf"\b([A-Z][\w&\.-]*(?:\s+[A-Z][\w&\.-]*){{0,6}}\s+{org_suffix})\b", text):
@@ -324,6 +357,25 @@ Return only valid entities as JSON array. NO phrases like "Quarterly Business", 
         # Specific public bodies often appear without suffix patterns
         for m in re.finditer(r"\b([A-Z][a-z]+\s+Municipal\s+Corporation)\b", text):
             add("organization", m.group(1), 0.93)
+        
+        # Well-known company names without suffix (case-sensitive)
+        known_companies = [
+            "Mahindra", "Tata", "Reliance", "Infosys", "Wipro", "TCS", "HCL", "Tech Mahindra",
+            "Bajaj", "Birla", "Adani", "HDFC", "ICICI", "SBI", "Kotak", "Axis",
+            "Amazon", "Google", "Microsoft", "Apple", "Meta", "Facebook", "IBM", "Oracle",
+            "Accenture", "Deloitte", "PwC", "EY", "KPMG", "McKinsey", "BCG", "Bain",
+            "Cognizant", "Capgemini", "L&T", "Larsen & Toubro", "Godrej", "ITC", "Hindustan Unilever",
+        ]
+        for company in known_companies:
+            for m in re.finditer(r"\b" + re.escape(company) + r"\b", text):
+                add("organization", m.group(0), 0.95)
+        
+        # Organizations with "of" or "and": "Bank of India", "Tata Sons and Associates"
+        for m in re.finditer(r"\b([A-Z][a-z]+(?:\s+(?:of|and|&)\s+[A-Z][a-z]+)+)\b", text):
+            candidate = m.group(1)
+            # Check if it looks like an org
+            if any(kw in candidate.lower() for kw in ['bank', 'institute', 'university', 'college', 'council', 'board', 'authority']):
+                add("organization", candidate, 0.88)
 
         # -------------------- INVOICE --------------------
         # Invoice IDs like "Invoice SHK-INF-0824-01" or "Invoice #INV-2024-12-001"
@@ -397,19 +449,32 @@ Return only valid entities as JSON array. NO phrases like "Quarterly Business", 
         # -------------------- LOCATION --------------------
         # India + common states/cities + named areas
         india_locations = [
-            "India",
-            "Pune",
-            "Maharashtra",
-            "Gujarat",
-            "Karnataka",
-            "Ahmedabad",
-            "Hinjewadi",
-            "Hinjewadi IT Park",
-            "Shivajinagar",
+            "India", "Pune", "Mumbai", "Delhi", "Bangalore", "Bengaluru", "Chennai", "Hyderabad",
+            "Kolkata", "Ahmedabad", "Jaipur", "Lucknow", "Kanpur", "Nagpur", "Indore", "Thane",
+            "Bhopal", "Visakhapatnam", "Patna", "Vadodara", "Ghaziabad", "Ludhiana", "Agra",
+            "Nashik", "Faridabad", "Meerut", "Rajkot", "Varanasi", "Srinagar", "Aurangabad",
+            "Dhanbad", "Amritsar", "Allahabad", "Ranchi", "Howrah", "Coimbatore", "Jabalpur",
+            "Gwalior", "Vijayawada", "Jodhpur", "Madurai", "Raipur", "Kota", "Guwahati",
+            "Chandigarh", "Solapur", "Hubballi", "Tiruchirappalli", "Bareilly", "Mysore", "Noida", "Gurgaon", "Gurugram",
+            "Maharashtra", "Gujarat", "Karnataka", "Tamil Nadu", "Telangana", "Andhra Pradesh",
+            "Uttar Pradesh", "Rajasthan", "West Bengal", "Madhya Pradesh", "Kerala", "Bihar",
+            "Hinjewadi", "Hinjewadi IT Park", "Shivajinagar", "Bandra", "Andheri", "Powai",
+            "Whitefield", "Electronic City", "HITEC City", "Gachibowli", "Cyber City",
         ]
         for loc in india_locations:
             for m in re.finditer(r"\b" + re.escape(loc) + r"\b", text, re.IGNORECASE):
                 add("location", m.group(0), 0.90)
+        
+        # Global locations
+        global_locations = [
+            "USA", "UK", "United States", "United Kingdom", "Canada", "Australia", "Germany",
+            "France", "Japan", "China", "Singapore", "Dubai", "UAE", "London", "New York",
+            "San Francisco", "California", "Texas", "Seattle", "Boston", "Chicago", "Toronto",
+            "Sydney", "Melbourne", "Tokyo", "Shanghai", "Beijing", "Hong Kong",
+        ]
+        for loc in global_locations:
+            for m in re.finditer(r"\b" + re.escape(loc) + r"\b", text, re.IGNORECASE):
+                add("location", m.group(0), 0.88)
 
         # Compound locations like "Pune, Maharashtra" / "Ahmedabad, Gujarat"
         indian_states = {
