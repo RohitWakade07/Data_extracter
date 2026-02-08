@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'utils', '.env'))
 
 from entity_extraction.entity_extractor import extract_from_text
-from integration_demo.integrated_pipeline import IntegratedPipeline
+from integration.integrated_pipeline import IntegratedPipeline
 from utils.domain_schema import validate_relationship_triple, VALID_TRIPLES
 
 BUSINESS_TEXT = """

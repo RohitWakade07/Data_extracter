@@ -148,75 +148,6 @@ class IntegratedPipeline:
         print("\n== PHASE 2: AGENTIC WORKFLOW VALIDATION")
         workflow_result = run_workflow(text)
         self.results["workflow"] = workflow_result
-        
-        # Use validated entities from workflow if available
-        validated_entities = workflow_result.get("entities", [])
-        if validated_entities and len(validated_entities) > 0:
-            # Convert to dict format if needed
-            if isinstance(validated_entities[0], dict):
-                entities = validated_entities
-            else:
-                # If it's in a different format, convert
-                entities = [
-                    {"type": e.get("type", "unknown"), "value": e.get("value", e.get("name", "")), "confidence": e.get("confidence", 0.5)}
-                    for e in validated_entities
-                ]
-        
-        # Update stored entities with validated ones
-        self.results["entities"] = entities
-        
-        # Build set of validated entity names for relationship filtering
-        validated_entity_names = set()
-        for e in entities:
-            name = e.get("value", e.get("name", ""))
-            if name:
-                name_lower = name.lower().strip()
-                validated_entity_names.add(name_lower)
-                # Also add without periods and common variations
-                validated_entity_names.add(name_lower.replace(".", "").strip())
-                validated_entity_names.add(name_lower.replace(",", "").strip())
-        
-        print(f"   Validated entity names for filtering: {validated_entity_names}")
-        
-        # Import blocklists for relationship filtering
-        from utils.domain_schema import NON_ORG_BLOCKLIST, NON_PERSON_BLOCKLIST
-        
-        # Filter relationships to only include validated entity references
-        filtered_relationships = []
-        for rel in relationships:
-            source = rel.get("source", "").lower().strip()
-            target = rel.get("target", "").lower().strip()
-            
-            # Check if source or target is in blocklist - reject immediately
-            if source in NON_ORG_BLOCKLIST or source in NON_PERSON_BLOCKLIST:
-                continue
-            if target in NON_ORG_BLOCKLIST or target in NON_PERSON_BLOCKLIST:
-                continue
-            
-            # Check for common blocked patterns
-            blocked_patterns = ["the firm", "the business", "the partnership", "partnership firm", 
-                              "the company", "court", "the court", "the parties", "the partners"]
-            if any(pat in source for pat in blocked_patterns) or any(pat in target for pat in blocked_patterns):
-                continue
-            
-            # Keep relationship only if both source and target are validated entities
-            source_valid = source in validated_entity_names or any(
-                source == name or (len(source) > 3 and len(name) > 3 and (source in name or name in source))
-                for name in validated_entity_names
-            )
-            target_valid = target in validated_entity_names or any(
-                target == name or (len(target) > 3 and len(name) > 3 and (target in name or name in target))
-                for name in validated_entity_names
-            )
-            
-            if source_valid and target_valid:
-                filtered_relationships.append(rel)
-            else:
-                print(f"   Filtered out: {source} -> {target} (source_valid={source_valid}, target_valid={target_valid})")
-        
-        print(f"   Relationships: {len(relationships)} -> {len(filtered_relationships)} after filtering")
-        relationships = filtered_relationships
-        self.results["relationships"] = relationships
 
         # Phase 3: Store in Weaviate (chunks already stored by SemanticExtractor)
         print("\n== PHASE 3: VECTOR DATABASE (Weaviate)")
@@ -227,7 +158,7 @@ class IntegratedPipeline:
         vector_result = store_in_weaviate([doc])
         self.results["vector_storage"] = vector_result
 
-        # Phase 4: Store in NebulaGraph (using validated entities and filtered relationships)
+        # Phase 4: Store in NebulaGraph
         print("\n== PHASE 4: KNOWLEDGE GRAPH (NebulaGraph)")
         graph_result = store_in_nebula(entities, relationships)
         self.results["graph_storage"] = graph_result
@@ -581,13 +512,11 @@ Return ONLY the JSON array:"""
 
             relationships = []
             for item in data:
-                if not isinstance(item, dict):
-                    continue
-                source = item.get('source') or ''
-                target = item.get('target') or ''
-                rel_type = item.get('relationship') or ''
-                src_type = (item.get('source_type') or 'entity').lower()
-                tgt_type = (item.get('target_type') or 'entity').lower()
+                source = item.get('source', '')
+                target = item.get('target', '')
+                rel_type = item.get('relationship', '')
+                src_type = item.get('source_type', 'entity').lower()
+                tgt_type = item.get('target_type', 'entity').lower()
 
                 if not (source and target and rel_type):
                     continue

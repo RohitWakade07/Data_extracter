@@ -4,13 +4,15 @@ Handles file uploads and runs the extraction pipeline
 Supports React frontend via CORS
 """
 
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, g
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import os
+import sys
 import shutil
+import time
 from dotenv import load_dotenv
-from integration_demo.integrated_pipeline import IntegratedPipeline
+from integration.integrated_pipeline import IntegratedPipeline
 from knowledge_graph.nebula_handler import NebulaGraphClient
 from vector_database.weaviate_handler import WeaviateClient
 from utils.helpers import print_section
@@ -26,8 +28,48 @@ app.config['UPLOAD_FOLDER'] = 'uploads'
 # Create uploads folder if it doesn't exist
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
+
+# ── Simple request/response logger using print + flush ─────────
+def _log(msg):
+    """Print a timestamped log line, flushing immediately."""
+    ts = time.strftime('%H:%M:%S')
+    print(f"[{ts}] {msg}", flush=True)
+
+
+@app.before_request
+def _before():
+    g.req_start = time.time()
+    parts = [f">> {request.method} {request.path}"]
+    qs = request.query_string.decode('utf-8', errors='replace')
+    if qs:
+        parts.append(f"?{qs}")
+    ct = request.content_type or ''
+    if 'json' in ct:
+        body = request.get_data(as_text=True)
+        preview = (body[:200] + '...') if len(body) > 200 else body
+        parts.append(f"  body={preview}")
+    elif 'multipart' in ct:
+        fnames = [f.filename for f in request.files.values()] if request.files else []
+        parts.append(f"  files={fnames}")
+    _log(''.join(parts))
+
+
+@app.after_request
+def _after(response):
+    dur = (time.time() - g.get('req_start', time.time())) * 1000
+    code = response.status_code
+    tag = 'OK' if code < 400 else 'ERR'
+    line = f"<< [{tag}] {code} {request.method} {request.path} ({dur:.0f}ms)"
+    ct = response.content_type or ''
+    if 'json' in ct:
+        body = response.get_data(as_text=True)
+        preview = (body[:300] + '...') if len(body) > 300 else body
+        line += f"\n     response={preview}"
+    _log(line)
+    return response
+
 # Initialize pipeline and handlers
-pipeline = IntegratedPipeline()
+pipeline = IntegratedPipeline(mode="semantic")
 nebula_handler = NebulaGraphClient()
 weaviate_handler = WeaviateClient()
 
@@ -830,6 +872,23 @@ def graph_traversal():
                 start_entity, start_type, target_type, max_depth
             )
             
+            # Format paths for frontend GraphPath type: { nodes, edges, depth }
+            formatted_paths = []
+            raw_paths = result.paths[:20] if hasattr(result, 'paths') else []
+            for p in raw_paths:
+                if isinstance(p, dict):
+                    formatted_paths.append({
+                        'nodes': p.get('nodes', []),
+                        'edges': p.get('edges', []),
+                        'depth': p.get('depth', len(p.get('nodes', [])) - 1)
+                    })
+                elif isinstance(p, (list, tuple)):
+                    formatted_paths.append({
+                        'nodes': list(p),
+                        'edges': [],
+                        'depth': len(p) - 1
+                    })
+
             return jsonify({
                 'success': True,
                 'start_entity': start_entity,
@@ -837,8 +896,8 @@ def graph_traversal():
                 'target_type': target_type,
                 'depth': result.depth,
                 'entities_found': result.entities,
-                'relationships': result.relationships[:50],  # Limit for response size
-                'paths': result.paths[:20]  # Limit paths shown
+                'relationships': result.relationships[:50],
+                'paths': formatted_paths
             }), 200
             
         except Exception as e:
@@ -864,7 +923,7 @@ def ingest_document():
     """
     try:
         data = request.get_json() or {}
-        text = data.get('text', '')
+        text = data.get('text', data.get('content', ''))  # Support both 'text' and 'content' field names
         document_id = data.get('document_id', f"doc_{uuid.uuid4().hex[:8]}")
         category = data.get('category', 'general')
         source_type = data.get('source_type', 'document')
@@ -889,10 +948,15 @@ def ingest_document():
                 'summary': result.summary,
                 'entities_count': len(result.entities),
                 'relationships_count': len(result.relationships),
+                # Both field name variants for frontend compatibility
+                'entities_extracted': len(result.entities),
+                'relationships_generated': len(result.relationships),
                 'entities': result.entities,
                 'relationships': result.relationships,
                 'weaviate_stored': result.weaviate_id is not None,
-                'graph_stored': result.graph_stored
+                'stored_in_weaviate': result.weaviate_id is not None,
+                'graph_stored': result.graph_stored,
+                'stored_in_nebula': result.graph_stored
             }), 200
             
         except Exception as e:
@@ -924,6 +988,108 @@ def get_graph_data():
     except Exception as e:
         print(f"Graph data error: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/document/<document_id>/graph', methods=['GET'])
+def get_document_graph(document_id):
+    """Get graph data for a specific document"""
+    try:
+        import requests as http_requests
+
+        # Search for the document in Weaviate
+        graphql_query = {
+            "query": f"""
+            {{
+                Get {{
+                    SemanticDocument(
+                        where: {{
+                            path: ["document_id"],
+                            operator: Equal,
+                            valueText: "{document_id}"
+                        }}
+                    ) {{
+                        document_id
+                        content
+                        category
+                        _additional {{
+                            id
+                        }}
+                    }}
+                }}
+            }}
+            """
+        }
+
+        response = http_requests.post(
+            "http://localhost:8080/v1/graphql",
+            json=graphql_query,
+            timeout=10
+        )
+
+        entities = []
+        relationships = []
+        doc_content = ""
+
+        if response.status_code == 200:
+            data = response.json()
+            docs = data.get("data", {}).get("Get", {}).get("SemanticDocument", [])
+            if docs:
+                doc_content = docs[0].get("content", "")
+
+        # Extract entities from the document content
+        if doc_content:
+            try:
+                from semantic_search.semantic_engine import SemanticSearchEngine
+                from semantic_search.relationship_mapper import EnhancedRelationshipMapper
+
+                engine = SemanticSearchEngine()
+                mapper = EnhancedRelationshipMapper()
+
+                # Search for the document to get its entities
+                results = engine.semantic_search(doc_content[:200], limit=1)
+                if results:
+                    for i, e in enumerate(results[0].entities):
+                        entities.append({
+                            'id': f'entity-{i}',
+                            'name': e.get('value', e.get('name', '')),
+                            'type': e.get('type', 'CUSTOM').upper(),
+                            'confidence': e.get('confidence', 0.85)
+                        })
+
+                    doc_rels = mapper.map_relationships_for_entities(
+                        results[0].entities, doc_content, ""
+                    )
+                    for j, rel in enumerate(doc_rels[:20]):
+                        relationships.append({
+                            'id': f'rel-{j}',
+                            'source': rel.source,
+                            'source_type': rel.source_type.upper(),
+                            'target': rel.target,
+                            'target_type': rel.target_type.upper(),
+                            'type': rel.relationship_type,
+                            'confidence': rel.confidence
+                        })
+            except Exception as e:
+                print(f"Entity extraction for document graph failed: {e}")
+
+        return jsonify({
+            'document_id': document_id,
+            'entities': entities,
+            'relationships': relationships,
+            'graph_data': {
+                'nodes': [{'id': e['id'], 'name': e['name'], 'type': e['type']} for e in entities],
+                'edges': [{'source': r['source'], 'target': r['target'], 'type': r['type']} for r in relationships]
+            }
+        }), 200
+
+    except Exception as e:
+        print(f"Document graph error: {str(e)}")
+        return jsonify({
+            'document_id': document_id,
+            'entities': [],
+            'relationships': [],
+            'error': str(e)
+        }), 500
 
 
 @app.route('/api/graph/stats', methods=['GET'])
@@ -1263,6 +1429,10 @@ def list_documents():
 
 
 if __name__ == '__main__':
-    print("Starting Data Extraction Frontend Server...")
-    print("Open browser: http://localhost:5000")
+    print('=' * 60, flush=True)
+    print('  Data Extraction Server', flush=True)
+    print('  API:       http://localhost:5000/api/', flush=True)
+    print('  Frontend:  http://localhost:5173', flush=True)
+    print('=' * 60, flush=True)
+    _log('Waiting for requests...')
     app.run(debug=False, port=5000, use_reloader=False)

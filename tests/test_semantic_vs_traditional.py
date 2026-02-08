@@ -166,7 +166,7 @@ def run_semantic_pipeline():
 def run_traditional_pipeline():
     """Run the existing 7-layer pipeline."""
     from entity_extraction.entity_extractor import extract_from_text
-    from integration_demo.integrated_pipeline import IntegratedPipeline
+    from integration.integrated_pipeline import IntegratedPipeline
 
     t0 = time.time()
     extraction = extract_from_text(BUSINESS_TEXT, provider="ollama")

@@ -50,21 +50,55 @@ class ValidationNode:
     
     @staticmethod
     def process(state: WorkflowState) -> WorkflowState:
-        """Validate extracted entities"""
+        """Validate and filter extracted entities"""
+        from utils.domain_schema import identify_entity_type, deduplicate_entities, clean_entity_value
+        
         print("Validating entities...")
         
         state.validation_passed = True
+        filtered_entities = []
         
-        # Validation rules - allow empty entities but validate structure
+        # Phase 1: Type identification, cleaning, and blocking
         for entity in state.extracted_entities:
             if not entity.get('type'):
                 state.validation_errors.append("Entity missing type")
-                state.validation_passed = False
+                continue
             if not entity.get('value'):
                 state.validation_errors.append("Entity missing value")
-                state.validation_passed = False
+                continue
+            
+            original_value = entity.get('value', '')
+            entity_type = entity.get('type', 'unknown')
+            
+            # Clean the entity value first (remove trailing words like "shall")
+            cleaned_value = clean_entity_value(original_value, entity_type)
+            if not cleaned_value or len(cleaned_value) < 2:
+                continue  # Value was all noise
+            
+            entity['value'] = cleaned_value
+            
+            # Re-identify type (may return "BLOCKED")
+            corrected_type = identify_entity_type(
+                cleaned_value,
+                entity_type
+            )
+            
+            if corrected_type == "BLOCKED":
+                # Skip this entity silently
+                continue
+            
+            # Update type if corrected
+            entity['type'] = corrected_type
+            
+            # Check confidence threshold
             if entity.get('confidence', 1.0) < 0.3:
                 state.validation_errors.append(f"Low confidence entity: {entity.get('value')}")
+                continue
+            
+            filtered_entities.append(entity)
+        
+        # Phase 2: Deduplication (handles fragments, honorifics, abbreviations)
+        state.extracted_entities = deduplicate_entities(filtered_entities)
         
         if state.validation_passed:
             print(f"Validation passed - {len(state.extracted_entities)} entities")

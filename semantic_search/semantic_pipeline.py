@@ -9,6 +9,7 @@ import json
 from entity_extraction.entity_extractor import extract_from_text, ExtractionResult
 from vector_database.weaviate_handler import Document, WeaviateClient
 from knowledge_graph.nebula_handler import NebulaGraphClient, store_in_nebula
+from utils.domain_schema import clean_entity_value, identify_entity_type, deduplicate_entities
 
 
 @dataclass
@@ -127,6 +128,9 @@ class SemanticGraphPipeline:
             for e in extraction_result.entities
         ]
         
+        # Step 1b: Clean and filter entities (remove noise, blocklist, deduplicate)
+        entities = self._clean_and_filter_entities(entities)
+        
         # Enhance entities with supply chain specific types
         entities = self._enhance_entities_for_supply_chain(entities, text)
         
@@ -165,6 +169,47 @@ class SemanticGraphPipeline:
             graph_stored=graph_result.get("entities_added", 0) > 0,
             category=category
         )
+    
+    def _clean_and_filter_entities(
+        self,
+        entities: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Clean and filter entities using domain schema validation.
+        
+        - Cleans entity values (removes trailing noise words like "shall")
+        - Blocks invalid entities (role names, date-related terms)
+        - Corrects entity types
+        - Deduplicates (merges "HDFC" with "HDFC Bank", etc.)
+        """
+        cleaned = []
+        
+        for entity in entities:
+            entity_type = entity.get("type", "unknown")
+            original_value = entity.get("value", "")
+            
+            # Skip empty values
+            if not original_value or not original_value.strip():
+                continue
+            
+            # Clean the value (remove trailing words like "shall", "and", etc.)
+            cleaned_value = clean_entity_value(original_value, entity_type)
+            if not cleaned_value or len(cleaned_value) < 2:
+                continue
+            
+            # Check if entity type should be corrected or blocked
+            corrected_type = identify_entity_type(cleaned_value, entity_type)
+            if corrected_type == "BLOCKED":
+                continue
+            
+            cleaned.append({
+                "type": corrected_type,
+                "value": cleaned_value,
+                "confidence": entity.get("confidence", 0.5)
+            })
+        
+        # Deduplicate (handles honorifics, abbreviations, substrings)
+        return deduplicate_entities(cleaned)
     
     def _enhance_entities_for_supply_chain(
         self,

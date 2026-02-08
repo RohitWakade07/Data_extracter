@@ -111,7 +111,9 @@ class NebulaGraphClient:
 
         self.pool = self._initialize_pool()
 
-   
+        # Track dynamically-created schema elements (per instance)
+        self._dynamic_tags: set = set()
+        self._dynamic_edges: set = set()
     def _initialize_pool(self):
         """Initialize NebulaGraph connection pool"""
         try:
@@ -599,6 +601,35 @@ class NebulaGraphClient:
     # ------------------------------------------------------------------
     # Data Insertion
     # ------------------------------------------------------------------
+
+    def _ensure_tag_exists(self, session, tag: str) -> None:
+        """Dynamically create a tag if it doesn't exist yet."""
+        if tag in self._dynamic_tags:
+            return
+        if tag in ["Date", "Amount"]:
+            session.execute(
+                f'CREATE TAG IF NOT EXISTS `{tag}`(value string, confidence float)'
+            )
+        else:
+            session.execute(
+                f'CREATE TAG IF NOT EXISTS `{tag}`(name string, confidence float)'
+            )
+        # Index so LOOKUP works
+        idx = f"idx_{tag.lower()}"
+        session.execute(f"CREATE TAG INDEX IF NOT EXISTS `{idx}` ON `{tag}`()")
+        self._dynamic_tags.add(tag)
+
+    def _ensure_edge_exists(self, session, edge: str) -> None:
+        """Dynamically create an edge type if it doesn't exist yet."""
+        if edge in self._dynamic_edges:
+            return
+        session.execute(
+            f'CREATE EDGE IF NOT EXISTS `{edge}`(confidence float)'
+        )
+        idx = f"idx_{edge.lower()}"
+        session.execute(f"CREATE EDGE INDEX IF NOT EXISTS `{idx}` ON `{edge}`()")
+        self._dynamic_edges.add(edge)
+
     def add_entity_node(
         self,
         entity_id: str,
@@ -607,7 +638,7 @@ class NebulaGraphClient:
         confidence: float = 1.0,
         extra_props: Dict[str, Any] = None
     ) -> bool:
-        """Add entity node with standardized tagging"""
+        """Add entity node with standardized tagging – auto-creates missing tags"""
         session = self._get_session()
         if not session:
             return False
@@ -615,9 +646,8 @@ class NebulaGraphClient:
         try:
             session.execute(f"USE {self.space}")
 
-            
             tag = ENTITY_TAG_MAP.get(entity_type.lower(), entity_type.capitalize())
-            
+
             # Clean entity value: remove newlines and strip whitespace
             clean_value = entity_value.replace("\n", " ").strip()
             # Escape quotes for nGQL
@@ -635,9 +665,23 @@ class NebulaGraphClient:
                     f'VALUES "{entity_id}":("{clean_value}", {confidence})'
                 )
 
-            session.execute(query)
-            print(f"Added {tag} node - {entity_value}")
-            return True
+            result = session.execute(query)
+
+            # If the tag doesn't exist, create it dynamically and retry
+            if not result.is_succeeded() and "TagNotFound" in result.error_msg():
+                print(f"   Auto-creating tag `{tag}` …")
+                self._ensure_tag_exists(session, tag)
+                time.sleep(1)  # let schema propagate
+                session.execute(f"REBUILD TAG INDEX idx_{tag.lower()}")
+                time.sleep(1)
+                result = session.execute(query)
+
+            if result.is_succeeded():
+                print(f"Added {tag} node - {entity_value}")
+                return True
+            else:
+                print(f"Node insert error: {result.error_msg()}")
+                return False
 
         except Exception as e:
             print(f"Node insert error: {e}")
@@ -680,32 +724,49 @@ class NebulaGraphClient:
             edge = relationship_type.upper()
 
             query = (
-                f'INSERT EDGE {edge}(confidence) '
+                f'INSERT EDGE `{edge}`(confidence) '
                 f'VALUES "{from_id}"->"{to_id}":({confidence})'
             )
-            
-            # Retry logic for atomic operation failures
+
+            # Retry logic with dynamic edge creation
             max_retries = 3
             for attempt in range(max_retries):
                 result = session.execute(query)
-                
+
                 if result.is_succeeded():
                     print(f"Added relationship {from_id} -[{edge}]-> {to_id}")
                     return True
-                
+
                 error_msg = result.error_msg()
-                
-                # Check if it's an atomic operation failure (race condition)
+
+                # Edge type doesn't exist → create it on the fly and retry
+                if "EdgeNotFound" in error_msg:
+                    print(f"   Auto-creating edge type `{edge}` …")
+                    self._ensure_edge_exists(session, edge)
+                    time.sleep(1)  # let schema propagate
+                    try:
+                        session.execute(f"REBUILD EDGE INDEX idx_{edge.lower()}")
+                    except Exception:
+                        pass
+                    time.sleep(1)
+                    # retry immediately
+                    result = session.execute(query)
+                    if result.is_succeeded():
+                        print(f"Added relationship {from_id} -[{edge}]-> {to_id}")
+                        return True
+                    # fall through to next attempt
+
+                # Atomic operation failure (race condition) → backoff & retry
                 if "Atomic operation failed" in error_msg:
                     if attempt < max_retries - 1:
-                        time.sleep(0.1 * (attempt + 1))  # Exponential backoff
+                        time.sleep(0.1 * (attempt + 1))
                         continue
-                
+
                 # Other errors or final attempt failed
                 print(f"Edge insert error: {from_id} -[{edge}]-> {to_id}")
                 print(f"   Error: {error_msg}")
                 return False
-            
+
             return False
 
         except Exception as e:
@@ -745,31 +806,44 @@ class NebulaGraphClient:
         finally:
             session.release()
 
+    # Tags whose value property is called 'value' instead of 'name'
+    _VALUE_TAGS = {'Date', 'Amount'}
+
     def get_all_entities(self) -> List[Dict[str, Any]]:
-        """Get all entities from the graph using LOOKUP with tag indexes"""
+        """Dynamically discover all tags via SHOW TAGS and LOOKUP every one."""
         session = self._get_session()
         if not session:
             return []
 
         try:
             session.execute(f"USE {self.space}")
-            
+
+            # ── Discover every tag that exists in the space ──
+            tag_result = session.execute("SHOW TAGS")
+            tag_types: List[str] = []
+            if tag_result.is_succeeded():
+                for row in tag_result.as_primitive():
+                    tag_name = row.get('Name') or row.get('name') or ''
+                    if tag_name:
+                        tag_types.append(tag_name)
+
+            if not tag_types:
+                print("No tags found in graph")
+                return []
+
             entities = []
-            # Query each entity type tag using LOOKUP
-            tag_types = ['Person', 'Organization', 'Location', 'Project', 'Invoice', 'Agreement', 'Amount', 'Date']
-            
             for tag_type in tag_types:
                 try:
-                    # LOOKUP with proper YIELD
-                    if tag_type in ['Date', 'Amount']:
-                        result = session.execute(f"LOOKUP ON `{tag_type}` YIELD id(vertex) as vid, properties(vertex).value as name")
+                    # Choose the right property name
+                    if tag_type in self._VALUE_TAGS:
+                        q = f'LOOKUP ON `{tag_type}` YIELD id(vertex) as vid, properties(vertex).value as name'
                     else:
-                        result = session.execute(f"LOOKUP ON `{tag_type}` YIELD id(vertex) as vid, properties(vertex).name as name")
-                    
+                        q = f'LOOKUP ON `{tag_type}` YIELD id(vertex) as vid, properties(vertex).name as name'
+
+                    result = session.execute(q)
+
                     if result.is_succeeded():
-                        # Use as_primitive() which returns a list of dicts
-                        data = result.as_primitive()
-                        for row in data:
+                        for row in result.as_primitive():
                             name = row.get('name', '')
                             if name:
                                 entities.append({
@@ -778,12 +852,11 @@ class NebulaGraphClient:
                                     "type": tag_type.lower(),
                                     "confidence": 0.8
                                 })
-                    else:
-                        print(f"LOOKUP for {tag_type}: {result.error_msg()}")
+                    # silently skip tags with no index
                 except Exception as tag_err:
                     print(f"Query for {tag_type} failed: {tag_err}")
                     continue
-            
+
             return entities
 
         except Exception as e:
@@ -793,41 +866,60 @@ class NebulaGraphClient:
         finally:
             session.release()
 
+    @staticmethod
+    def _vid_to_name(vid: str) -> str:
+        """Convert vertex ID to readable name:  person_Rahul_Deshmukh → Rahul Deshmukh"""
+        parts = vid.split('_', 1)
+        name = parts[1] if len(parts) > 1 else vid
+        return name.replace('_', ' ')
+
     def get_all_relationships(self) -> List[Dict[str, Any]]:
-        """Get all relationships from the graph using LOOKUP"""
+        """Dynamically discover all edge types via SHOW EDGES and LOOKUP every one."""
         session = self._get_session()
         if not session:
             return []
 
         try:
             session.execute(f"USE {self.space}")
-            
+
+            # ── Discover every edge type that exists in the space ──
+            edge_result = session.execute("SHOW EDGES")
+            edge_types: List[str] = []
+            if edge_result.is_succeeded():
+                for row in edge_result.as_primitive():
+                    edge_name = row.get('Name') or row.get('name') or ''
+                    if edge_name:
+                        edge_types.append(edge_name)
+
+            if not edge_types:
+                print("No edge types found in graph")
+                return []
+
             relationships = []
-            # Query all edge types using LOOKUP
-            edge_types = ['WORKS_AT', 'LOCATED_IN', 'WORKS_ON', 'MANAGES', 'PARTY_TO', 
-                          'SIGNED_ON', 'HAS_AMOUNT', 'EFFECTIVE_ON', 'HAS_VALUE', 'ISSUED', 'DUE_ON']
-            
             for edge_type in edge_types:
                 try:
-                    result = session.execute(f"LOOKUP ON `{edge_type}` YIELD src(edge) as src, dst(edge) as dst")
-                    
+                    result = session.execute(
+                        f"LOOKUP ON `{edge_type}` YIELD src(edge) as src, dst(edge) as dst"
+                    )
+
                     if result.is_succeeded():
-                        data = result.as_primitive()
-                        for row in data:
+                        for row in result.as_primitive():
                             src = row.get('src', '')
                             dst = row.get('dst', '')
                             if src and dst:
                                 relationships.append({
-                                    "source": src,
+                                    "source": self._vid_to_name(src),
+                                    "target": self._vid_to_name(dst),
                                     "type": edge_type,
-                                    "target": dst
+                                    "relationship_type": edge_type,
+                                    "source_id": src,
+                                    "target_id": dst,
                                 })
-                    else:
-                        print(f"LOOKUP for edge {edge_type}: {result.error_msg()}")
+                    # silently skip edges with no index
                 except Exception as edge_err:
                     print(f"Query for {edge_type} failed: {edge_err}")
                     continue
-            
+
             return relationships
 
         except Exception as e:

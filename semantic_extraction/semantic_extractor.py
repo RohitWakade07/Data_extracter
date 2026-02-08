@@ -466,100 +466,99 @@ Return ONLY a JSON array:"""
         full_text: str,
     ) -> List[SemanticRelationship]:
         """
-        Discover relationships by:
-        1. Finding entity-pairs that co-occur in the same chunk
-        2. Using the chunk context to ask the LLM what relationship connects them
-        3. Scoring by semantic similarity between entity embeddings
+        Discover relationships using production-grade validation:
+        
+        1. Find entity-pairs that co-occur in the same sentence/paragraph
+        2. Check for explicit verb/keyword evidence
+        3. Apply directional constraints
+        4. Compute deterministic confidence (not LLM-generated)
+        5. Only emit relationships with sufficient evidence
+        
+        This addresses:
+          - Relation explosion (overgeneration)
+          - Role leakage (person→org contamination)
+          - Symmetric relation duplication
+          - Flat/misleading confidence scores
         """
-        from utils.domain_schema import validate_relationship_triple, VALID_TRIPLES
+        from utils.relation_validator import (
+            RelationshipValidator,
+            entities_in_same_sentence,
+            find_evidence_for_relation,
+            CORE_RELATIONS,
+            DIRECTIONAL_CONSTRAINTS,
+        )
+        
+        validator = RelationshipValidator(
+            min_confidence=0.45,
+            require_same_sentence=False,  # Allow paragraph-level
+            require_evidence=True,         # Require keyword evidence
+        )
 
-        # Build entity → chunk mapping
-        entity_chunks: Dict[str, Set[str]] = {}
-        for e in entities:
-            entity_chunks[e.value.lower()] = set(e.source_chunks)
-
-        # Also check textual presence in chunks (entity might appear in chunks
-        # where it wasn't explicitly extracted)
-        chunk_lookup = {c.chunk_id: c for c in chunks}
-        for e in entities:
-            for c in chunks:
-                if e.value.lower() in c.text.lower():
-                    entity_chunks.setdefault(e.value.lower(), set()).add(c.chunk_id)
-
-        # Find co-occurring entity pairs
+        # Build entity lookup
+        entity_map = {e.value.lower(): e for e in entities}
         relationships: List[SemanticRelationship] = []
-        pair_contexts: Dict[Tuple[str, str], List[str]] = {}  # (ent1, ent2) → chunk texts
+        seen_pairs: Set[Tuple[str, str, str]] = set()  # (src, tgt, rel)
 
+        # Process each entity pair
         for i, e1 in enumerate(entities):
             for j, e2 in enumerate(entities):
                 if i >= j:
                     continue
+                # Skip same-type pairs for dates/amounts
                 if e1.type == e2.type and e1.type in ('date', 'amount'):
-                    continue  # Skip date↔date, amount↔amount
+                    continue
 
-                # Find shared chunks
-                chunks_e1 = entity_chunks.get(e1.value.lower(), set())
-                chunks_e2 = entity_chunks.get(e2.value.lower(), set())
-                shared = chunks_e1 & chunks_e2
+                # ── Determine valid relations for this type pair ──
+                candidate_rels = []
+                for rel, (allowed_src, allowed_tgt) in DIRECTIONAL_CONSTRAINTS.items():
+                    if e1.type == allowed_src and e2.type == allowed_tgt:
+                        candidate_rels.append((rel, e1, e2))
+                    elif e2.type == allowed_src and e1.type == allowed_tgt:
+                        candidate_rels.append((rel, e2, e1))
+                
+                # Also check symmetric relations
+                if e1.type == "organization" and e2.type == "organization":
+                    candidate_rels.append(("PARTNERS_WITH", e1, e2))
 
-                if shared:
-                    # These entities co-occur in at least one chunk
-                    context_texts = [chunk_lookup[cid].text for cid in shared if cid in chunk_lookup]
-                    pair_contexts[(e1.value, e2.value)] = context_texts
+                if not candidate_rels:
+                    continue  # No valid relations possible
 
-        # For each co-occurring pair, determine the relationship
-        # Use the domain schema VALID_TRIPLES to constrain
-        entity_map = {e.value.lower(): e for e in entities}
+                # ── Validate each candidate relation ──
+                for rel_type, src_ent, tgt_ent in candidate_rels:
+                    # Skip if we've already seen this triple
+                    key = (src_ent.value.lower(), tgt_ent.value.lower(), rel_type)
+                    if key in seen_pairs:
+                        continue
 
-        for (e1_val, e2_val), contexts in pair_contexts.items():
-            e1 = entity_map.get(e1_val.lower())
-            e2 = entity_map.get(e2_val.lower())
-            if not e1 or not e2:
-                continue
+                    result = validator.validate(
+                        source=src_ent.value,
+                        source_type=src_ent.type,
+                        target=tgt_ent.value,
+                        target_type=tgt_ent.type,
+                        proposed_relation=rel_type,
+                        full_text=full_text,
+                    )
 
-            # Check what relationships are valid for this type pair
-            valid_rels_forward = [
-                (src, rel, tgt) for src, rel, tgt in VALID_TRIPLES
-                if src == e1.type and tgt == e2.type
-            ]
-            valid_rels_reverse = [
-                (src, rel, tgt) for src, rel, tgt in VALID_TRIPLES
-                if src == e2.type and tgt == e1.type
-            ]
-
-            # Compute semantic similarity between the two entities' embeddings
-            sem_score = 0.0
-            if e1.embedding and e2.embedding:
-                a = np.array(e1.embedding, dtype=np.float32)
-                b = np.array(e2.embedding, dtype=np.float32)
-                sem_score = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
-
-            # Forward relationships
-            for src_t, rel_type, tgt_t in valid_rels_forward:
-                # Compute confidence based on co-occurrence + semantic score
-                base_conf = 0.80 if len(contexts) > 1 else 0.70
-                conf = min(0.95, base_conf + sem_score * 0.10)
-                relationships.append(SemanticRelationship(
-                    source=e1.value, source_type=e1.type,
-                    target=e2.value, target_type=e2.type,
-                    relationship=rel_type,
-                    confidence=round(conf, 3),
-                    evidence_chunks=[c[:100] for c in contexts[:2]],
-                    semantic_score=round(sem_score, 3),
-                ))
-
-            # Reverse relationships
-            for src_t, rel_type, tgt_t in valid_rels_reverse:
-                base_conf = 0.80 if len(contexts) > 1 else 0.70
-                conf = min(0.95, base_conf + sem_score * 0.10)
-                relationships.append(SemanticRelationship(
-                    source=e2.value, source_type=e2.type,
-                    target=e1.value, target_type=e1.type,
-                    relationship=rel_type,
-                    confidence=round(conf, 3),
-                    evidence_chunks=[c[:100] for c in contexts[:2]],
-                    semantic_score=round(sem_score, 3),
-                ))
+                    if result.is_valid:
+                        seen_pairs.add(key)
+                        
+                        # Compute semantic similarity for additional scoring
+                        sem_score = 0.0
+                        if src_ent.embedding and tgt_ent.embedding:
+                            a = np.array(src_ent.embedding, dtype=np.float32)
+                            b = np.array(tgt_ent.embedding, dtype=np.float32)
+                            sem_score = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
+                        
+                        relationships.append(SemanticRelationship(
+                            source=result.source,
+                            source_type=result.source_type,
+                            target=result.target,
+                            target_type=result.target_type,
+                            relationship=result.relation,
+                            confidence=round(result.confidence, 3),
+                            evidence_chunks=result.evidence_matches or [],
+                            semantic_score=round(sem_score, 3),
+                        ))
 
         return relationships
 
@@ -573,82 +572,23 @@ Return ONLY a JSON array:"""
         chunks: List[SemanticChunk],
     ) -> List[SemanticRelationship]:
         """
-        Find relationships between entities that DON'T share a chunk,
-        but whose chunks are semantically similar.
-
-        This catches implicit/indirect relationships spanning paragraphs.
-        Example: Paragraph 1 mentions "HDFC Bank" as escrow agent,
-                 Paragraph 5 mentions "fund disbursements".
-                 These chunks are semantically related even though the
-                 entities don't co-occur textually.
+        Cross-chunk relationship discovery is DISABLED in production mode.
+        
+        Reason: Cross-chunk relationships are high-risk for hallucination.
+        When entities don't appear in the same sentence/paragraph, we cannot
+        reliably infer a relationship between them without explicit evidence.
+        
+        This prevents:
+          - Role leakage (Tim Cook LEADS OpenAI)
+          - False partnerships (Apple PARTNERS_WITH Microsoft)
+          - Hallucinated contracts across document sections
+        
+        If cross-chunk relationships are needed, they should be discovered
+        through explicit multi-hop graph queries after initial extraction.
         """
-        from utils.domain_schema import validate_relationship_triple, VALID_TRIPLES
-
-        chunk_lookup = {c.chunk_id: c for c in chunks}
-        relationships: List[SemanticRelationship] = []
-        seen: Set[Tuple[str, str, str]] = set()
-
-        # For each pair of entities NOT already sharing a chunk
-        entity_chunks: Dict[str, Set[str]] = {}
-        for e in entities:
-            for c in chunks:
-                if e.value.lower() in c.text.lower():
-                    entity_chunks.setdefault(e.value.lower(), set()).add(c.chunk_id)
-
-        for i, e1 in enumerate(entities):
-            for j, e2 in enumerate(entities):
-                if i >= j:
-                    continue
-                if e1.type == e2.type and e1.type in ('date', 'amount'):
-                    continue
-
-                c1 = entity_chunks.get(e1.value.lower(), set())
-                c2 = entity_chunks.get(e2.value.lower(), set())
-
-                # Skip if they already share a chunk (handled in Step 4)
-                if c1 & c2:
-                    continue
-
-                # Check semantic similarity between their chunks
-                if not c1 or not c2:
-                    continue
-
-                # Find max cosine similarity between any chunk of e1 and any chunk of e2
-                max_sim = 0.0
-                best_pair = ("", "")
-                for cid1 in c1:
-                    for cid2 in c2:
-                        ch1 = chunk_lookup.get(cid1)
-                        ch2 = chunk_lookup.get(cid2)
-                        if ch1 and ch2 and ch1.embedding and ch2.embedding:
-                            a = np.array(ch1.embedding, dtype=np.float32)
-                            b = np.array(ch2.embedding, dtype=np.float32)
-                            sim = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
-                            if sim > max_sim:
-                                max_sim = sim
-                                best_pair = (cid1, cid2)
-
-                # If chunks are semantically similar enough, infer relationship
-                if max_sim >= 0.45:  # lower threshold for cross-chunk
-                    valid_rels = [
-                        (src, rel, tgt) for src, rel, tgt in VALID_TRIPLES
-                        if src == e1.type and tgt == e2.type
-                    ]
-                    for _, rel_type, _ in valid_rels:
-                        key = (e1.value.lower(), e2.value.lower(), rel_type)
-                        if key not in seen:
-                            seen.add(key)
-                            conf = round(0.55 + max_sim * 0.30, 3)
-                            relationships.append(SemanticRelationship(
-                                source=e1.value, source_type=e1.type,
-                                target=e2.value, target_type=e2.type,
-                                relationship=rel_type,
-                                confidence=conf,
-                                evidence_chunks=[best_pair[0], best_pair[1]],
-                                semantic_score=round(max_sim, 3),
-                            ))
-
-        return relationships
+        # Return empty — cross-chunk implicit relationships are too risky
+        # Enable only if you have a reliable evidence extraction mechanism
+        return []
 
     # ==================================================================
     # Deduplication
