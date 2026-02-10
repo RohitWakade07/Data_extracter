@@ -1,31 +1,28 @@
-# Core Agent Framework
-langchain>=0.1.0
-langgraph>=0.1.0
-
 # LLM Providers
 langchain-openai>=0.1.0
 langchain-google-genai>=0.1.0
 openai>=1.3.0
-google-generativeai>=0.3.0
 
-# Databases
+# Agentic Workflow
+langgraph>=0.1.0
+
+# Vector Database
 weaviate-client>=4.4.0
+
+# Graph Database
 nebula3-python>=3.8.0
 
 # Web Framework
 Flask>=2.3.0
 flask-cors>=4.0.0
-Werkzeug>=2.3.0
 
 # File Processing
 PyPDF2>=3.0.0
 python-docx>=0.8.11
 
-# OCR (Images)
+# OCR
 pytesseract>=0.3.10
 pillow>=10.0.0
-
-# OCR (Scanned PDFs)
 pymupdf>=1.23.0
 
 # Utilities
@@ -35,9 +32,14 @@ requests>=2.31.0
 # Data Models
 pydantic>=2.0.0,<3.0.0
 
+<<<<<<< Updated upstream
 # Semantic Extraction (embedding-first pipeline)
 sentence-transformers>=2.2.0
 numpy>=1.24.0
 
 # Testing
 pytest>=7.4.0
+=======
+# Optional: Local embeddings (install if not using OpenAI embeddings)
+sentence-transformers>=2.2.0
+>>>>>>> Stashed changes

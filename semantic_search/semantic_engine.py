@@ -25,7 +25,7 @@ class SemanticSearchEngine:
     Advanced semantic search engine using Weaviate vector database.
     
     Features:
-    - True vector similarity search (not just keyword matching)
+    - True vector similarity search using embeddings
     - Semantic understanding of queries
     - Entity-aware search
     - Multi-modal document support
@@ -38,6 +38,7 @@ class SemanticSearchEngine:
     ):
         self.url = weaviate_url.rstrip('/')
         self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
+        self._vector_store = None
         self.client = self._initialize_client()
         
     def _initialize_client(self) -> bool:
@@ -54,8 +55,9 @@ class SemanticSearchEngine:
     
     def create_semantic_schema(self) -> bool:
         """
-        Create schema for semantic search with BM25 support.
-        Uses keyword-based search with semantic query expansion.
+        Create schema for semantic search.
+        Vector search is handled via core/vector_store.py with embeddings.
+        This schema is for document storage and metadata filtering.
         """
         if not self.client:
             return False
@@ -67,17 +69,17 @@ class SemanticSearchEngine:
                 print("✓ Semantic schema already exists")
                 return True
             
-            # Schema without vectorizer (uses BM25 for search)
+            # Schema for document storage (vectors handled separately)
             schema = {
                 "class": "SemanticDocument",
-                "description": "Document for semantic search using BM25 with query expansion",
-                "vectorizer": "none",  # No vectorizer - use BM25
+                "description": "Document for semantic search with vector embeddings",
+                "vectorizer": "none",  # Vectors provided externally via embedding service
                 "properties": [
                     {
                         "name": "content",
                         "dataType": ["text"],
                         "description": "Full document content for semantic search",
-                        "indexSearchable": True,  # Enable BM25 search
+                        "indexSearchable": True,
                         "tokenization": "word"
                     },
                     {
@@ -125,7 +127,7 @@ class SemanticSearchEngine:
             response = requests.post(f"{self.url}/v1/schema", json=schema, timeout=15)
             
             if response.status_code in [200, 201]:
-                print("✓ Semantic schema created successfully (BM25 search enabled)")
+                print("✓ Semantic schema created successfully")
                 return True
             else:
                 print(f"⚠ Schema creation failed: {response.text}")
@@ -234,6 +236,25 @@ class SemanticSearchEngine:
         
         return list(keywords)[:20]  # Limit to 20 keywords
     
+    @property
+    def vector_store(self):
+        """Lazy-load vector store for semantic search"""
+        if self._vector_store is None:
+            try:
+                from core.vector_store import WeaviateVectorStore
+                from core.embedding_service import HybridEmbedding
+                
+                embedding_service = HybridEmbedding()
+                self._vector_store = WeaviateVectorStore(
+                    weaviate_url=self.url,
+                    embedding_service=embedding_service
+                )
+                self._vector_store.initialize()
+            except Exception as e:
+                print(f"⚠ Vector store initialization failed: {e}")
+                self._vector_store = None
+        return self._vector_store
+    
     def semantic_search(
         self,
         query: str,
@@ -242,9 +263,9 @@ class SemanticSearchEngine:
         category_filter: Optional[str] = None
     ) -> List[SearchResult]:
         """
-        Perform semantic search using meaning-based matching.
+        Perform semantic search using vector similarity.
         
-        This finds documents by MEANING, not just keywords.
+        This finds documents by MEANING using embeddings, not keywords.
         
         Example:
         - Query: "Why are shipments getting delayed?"
@@ -262,233 +283,67 @@ class SemanticSearchEngine:
         if not self.client:
             return []
         
-        # Use BM25 keyword search with semantic expansion
-        # This works without text2vec module
-        return self._bm25_semantic_search(query, limit, category_filter)
+        # Use vector similarity search
+        return self._vector_semantic_search(query, limit, category_filter)
     
-    def _bm25_semantic_search(
+    def _vector_semantic_search(
         self,
         query: str,
         limit: int = 10,
         category_filter: Optional[str] = None
     ) -> List[SearchResult]:
         """
-        Semantic search using BM25 with query expansion.
+        Semantic search using real vector embeddings.
         
-        Expands the query with synonyms and related terms to achieve
-        semantic-like matching without requiring vector embeddings.
-        
-        IMPORTANT: Original query terms are prioritized over expansions.
-        Searches both SemanticDocument and ExtractedDocument classes.
+        Uses OpenAI embeddings for true semantic similarity matching.
         """
-        # Get original terms first (these are most important)
-        original_terms = [t for t in query.lower().split() if len(t) > 2]
-        
-        # Expand query with synonyms
-        expanded_terms = self._expand_query_semantically(query)
-        
-        # Build search query with original terms repeated for higher weight
-        # BM25 gives more weight to repeated terms
-        search_query = " ".join(original_terms * 2 + expanded_terms)
-        
-        # CRITICAL: Escape special characters for GraphQL string
-        # Remove quotes and special chars that break GraphQL syntax
-        search_query = search_query.replace('"', '').replace("'", "").replace('\\', '')
-        search_query = search_query.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
-        # Clean up multiple spaces
-        search_query = ' '.join(search_query.split())
-        
-        results = []
-        
         try:
-            # Build where filter if category specified
-            where_clause = ""
+            if self.vector_store is None:
+                print("⚠ Vector store not available, returning empty results")
+                return []
+            
+            # Build filters
+            filters = {}
             if category_filter:
-                where_clause = f'''
-                    where: {{
-                        path: ["category"],
-                        operator: Equal,
-                        valueText: "{category_filter}"
-                    }}
-                '''
+                filters["category"] = category_filter
             
-            # 1. Search SemanticDocument class with BM25
-            graphql_query = {
-                "query": f"""
-                {{
-                    Get {{
-                        SemanticDocument(
-                            bm25: {{
-                                query: "{search_query}"
-                            }}
-                            limit: {limit}
-                            {where_clause}
-                        ) {{
-                            content
-                            summary
-                            entities_json
-                            document_id
-                            source_type
-                            category
-                            keywords
-                            _additional {{
-                                id
-                                score
-                            }}
-                        }}
-                    }}
-                }}
-                """
-            }
-            
-            response = requests.post(
-                f"{self.url}/v1/graphql",
-                json=graphql_query,
-                timeout=30
+            # Perform vector search
+            core_results = self.vector_store.search(
+                query=query,
+                limit=limit,
+                filters=filters if filters else None
             )
             
-            if response.status_code == 200:
-                data = response.json()
-                
-                if "errors" not in data:
-                    documents = data.get("data", {}).get("Get", {}).get("SemanticDocument", [])
-                    
-                    for doc in documents:
-                        additional = doc.get("_additional", {})
-                        raw_score = additional.get("score", 0.5)
-                        
-                        # Normalize BM25 score to 0-1 range
-                        try:
-                            score = float(raw_score) if raw_score else 0.5
-                            score = min(score / 10.0, 1.0) if score > 1.0 else score
-                        except (TypeError, ValueError):
-                            score = 0.5
-                        
-                        entities = []
-                        try:
-                            entities_json = doc.get("entities_json", "[]")
-                            entities = json.loads(entities_json) if entities_json else []
-                        except:
-                            pass
-                        
-                        highlights = self._extract_highlights(doc.get("content", ""), query)
-                        
-                        results.append(SearchResult(
-                            id=additional.get("id", ""),
-                            content=doc.get("content", ""),
-                            score=score,
-                            entities=entities,
-                            metadata={
-                                "summary": doc.get("summary", ""),
-                                "category": doc.get("category", ""),
-                                "keywords": doc.get("keywords", []),
-                                "document_id": doc.get("document_id", "")
-                            },
-                            source_type=doc.get("source_type", "document"),
-                            highlights=highlights
-                        ))
-            
-            # 2. Also search ExtractedDocument class (legacy/uploaded docs)
-            extracted_results = self._search_extracted_documents(query, search_query, limit)
-            results.extend(extracted_results)
-            
-            # Sort all results by score and return top limit
-            results.sort(key=lambda x: x.score, reverse=True)
-            return results[:limit]
-            
-        except Exception as e:
-            print(f"⚠ BM25 search error: {e}")
-            return self._fallback_search(query, limit)
-    
-    def _search_extracted_documents(
-        self,
-        original_query: str,
-        search_query: str,
-        limit: int = 10
-    ) -> List[SearchResult]:
-        """
-        Search ExtractedDocument class for documents uploaded via the pipeline.
-        Uses keyword matching with expanded terms.
-        """
-        try:
-            # ExtractedDocument doesn't support BM25, so get all and filter
-            graphql_query = {
-                "query": f"""
-                {{
-                    Get {{
-                        ExtractedDocument(limit: {limit * 2}) {{
-                            content
-                            entities
-                            documentId
-                            sourceType
-                            _additional {{
-                                id
-                            }}
-                        }}
-                    }}
-                }}
-                """
-            }
-            
-            response = requests.post(
-                f"{self.url}/v1/graphql",
-                json=graphql_query,
-                timeout=30
-            )
-            
-            if response.status_code != 200:
-                return []
-            
-            data = response.json()
-            if "errors" in data:
-                return []
-                
-            documents = data.get("data", {}).get("Get", {}).get("ExtractedDocument", [])
-            
+            # Convert to SearchResult format
             results = []
-            query_terms = set(search_query.lower().split())
-            original_terms = set(original_query.lower().split())
+            for r in core_results:
+                # Convert entities from Entity objects to dicts
+                entities = []
+                for e in r.entities:
+                    if hasattr(e, '__dict__'):
+                        entities.append({
+                            'type': getattr(e, 'type', 'unknown'),
+                            'value': getattr(e, 'value', ''),
+                            'confidence': getattr(e, 'confidence', 1.0)
+                        })
+                    elif isinstance(e, dict):
+                        entities.append(e)
+                
+                results.append(SearchResult(
+                    id=r.id,
+                    content=r.content,
+                    score=r.score,
+                    entities=entities,
+                    metadata=r.metadata,
+                    source_type=r.metadata.get('source_type', 'document'),
+                    highlights=[]
+                ))
             
-            for doc in documents:
-                content = doc.get("content", "").lower()
-                entities_str = doc.get("entities", "").lower()
-                
-                # Calculate relevance score
-                # Higher weight for original query terms
-                original_matches = sum(2 for term in original_terms if term in content or term in entities_str)
-                expanded_matches = sum(1 for term in query_terms if term in content or term in entities_str)
-                
-                total_matches = original_matches + expanded_matches
-                max_possible = len(original_terms) * 2 + len(query_terms)
-                
-                if total_matches > 0:
-                    score = min(total_matches / max(max_possible, 1) + 0.2, 1.0)
-                    
-                    entities = []
-                    try:
-                        entities = json.loads(doc.get("entities", "[]"))
-                    except:
-                        pass
-                    
-                    highlights = self._extract_highlights(doc.get("content", ""), original_query)
-                    
-                    results.append(SearchResult(
-                        id=doc.get("_additional", {}).get("id", ""),
-                        content=doc.get("content", ""),
-                        score=score,
-                        entities=entities,
-                        metadata={
-                            "document_id": doc.get("documentId", ""),
-                            "source_class": "ExtractedDocument"
-                        },
-                        source_type=doc.get("sourceType", "document"),
-                        highlights=highlights
-                    ))
-            
+            print(f"✓ Vector search returned {len(results)} results for: {query[:50]}...")
             return results
             
         except Exception as e:
-            print(f"⚠ ExtractedDocument search error: {e}")
+            print(f"⚠ Vector search error: {e}")
             return []
 
     def _expand_query_semantically(self, query: str) -> List[str]:
@@ -852,7 +707,7 @@ class SemanticSearchEngine:
         alpha: float = 0.75
     ) -> List[SearchResult]:
         """
-        Hybrid search combining vector (semantic) and keyword (BM25) search.
+        Hybrid search combining vector similarity and keyword matching.
         
         Args:
             query: Search query
