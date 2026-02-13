@@ -9,7 +9,7 @@ import json
 from entity_extraction.entity_extractor import extract_from_text, ExtractionResult
 from vector_database.weaviate_handler import Document, WeaviateClient
 from knowledge_graph.nebula_handler import NebulaGraphClient, store_in_nebula
-from utils.domain_schema import clean_entity_value, identify_entity_type, deduplicate_entities
+from utils.domain_schema import clean_entity_value, deduplicate_entities
 
 
 @dataclass
@@ -197,13 +197,8 @@ class SemanticGraphPipeline:
             if not cleaned_value or len(cleaned_value) < 2:
                 continue
             
-            # Check if entity type should be corrected or blocked
-            corrected_type = identify_entity_type(cleaned_value, entity_type)
-            if corrected_type == "BLOCKED":
-                continue
-            
             cleaned.append({
-                "type": corrected_type,
+                "type": entity_type,
                 "value": cleaned_value,
                 "confidence": entity.get("confidence", 0.5)
             })
@@ -638,35 +633,59 @@ class SemanticGraphPipeline:
         matches: List[Dict[str, Any]],
         graph_paths: List[Dict[str, Any]]
     ) -> str:
-        """Generate a natural language answer from search results"""
+        """Generate a natural language answer from search results using LLM."""
         if not matches:
             return "No relevant information found."
-        
-        answer_parts = []
-        
-        # Extract key insights from semantic matches
+
+        # Build context from matches
+        context_parts = []
         for i, match in enumerate(matches[:3], 1):
-            highlights = match.get('highlights', [])
-            if highlights:
-                answer_parts.append(f"• {highlights[0]}")
-            else:
-                content = match.get('content', '')[:150]
-                if content:
-                    answer_parts.append(f"• {content}...")
-        
+            content = match.get('content', '')[:500]
+            if content:
+                context_parts.append(f"Document {i}: {content}")
+
+        context = "\n\n".join(context_parts)
+
         # Add graph context
+        graph_info = ""
         if graph_paths:
-            answer_parts.append("\nRelated connections:")
-            for path in graph_paths[:2]:
+            graph_lines = []
+            for path in graph_paths[:3]:
                 entity = path.get('entity', '')
-                rels = path.get('relationships', [])
-                if rels:
-                    for rel in rels[:2]:
-                        conn = rel.get('connected_entity', '')
-                        rel_type = rel.get('type', '')
-                        answer_parts.append(f"• {entity} → {rel_type} → {conn}")
-        
-        return "\n".join(answer_parts) if answer_parts else "Results found but no summary available."
+                for rel in path.get('relationships', [])[:2]:
+                    conn = rel.get('connected_entity', '')
+                    rel_type = rel.get('type', '')
+                    graph_lines.append(f"- {entity} → {rel_type} → {conn}")
+            if graph_lines:
+                graph_info = "\n\nKnowledge Graph relationships:\n" + "\n".join(graph_lines)
+
+        # Use LLM for answer generation
+        try:
+            import os
+            from utils.ollama_handler import OllamaLLM
+            llm = OllamaLLM(model=os.getenv("OLLAMA_MODEL", "llama3"))
+            prompt = (
+                f'Based on the following search results, answer this question:\n'
+                f'Question: "{query}"\n\n'
+                f'{context}{graph_info}\n\n'
+                f'Provide a clear, concise answer (2-5 sentences) based ONLY on '
+                f'the information above.'
+            )
+            answer = llm.chat(prompt)
+            return answer.strip()
+        except Exception as e:
+            print(f"⚠ LLM answer generation failed: {e}")
+            # Fallback
+            answer_parts = []
+            for match in matches[:3]:
+                highlights = match.get('highlights', [])
+                if highlights:
+                    answer_parts.append(f"• {highlights[0]}")
+                else:
+                    content = match.get('content', '')[:150]
+                    if content:
+                        answer_parts.append(f"• {content}...")
+            return "\n".join(answer_parts) if answer_parts else "Results found but no summary available."
 
 
 # Convenience function for quick queries

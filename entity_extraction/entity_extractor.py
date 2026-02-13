@@ -74,24 +74,31 @@ class EntityExtractor:
         Returns:
             ExtractionResult containing extracted entities
         """
-        # Token-efficient prompt — tuned for llama3
-        prompt = f"""You are a precise Named Entity Recognition (NER) system. Extract ALL entities from the text below.
+        # Token-efficient prompt — dynamic type discovery, no hardcoded type list
+        prompt = f"""You are a precise Named Entity Recognition (NER) system. Extract ALL meaningful entities from the text below.
 
-IMPORTANT: You MUST find EVERY person, organization, location, date, amount, project, invoice, and agreement mentioned in the text. Do NOT skip any.
+For EACH entity, classify it with the MOST SPECIFIC and ACCURATE type based on its real-world meaning in context.
+
+CLASSIFICATION RULES (apply strictly):
+- PERSON: ONLY real human names (first + last name). NOT titles, roles, descriptions, pronouns, or concepts.
+- ORGANIZATION: Named companies, firms, banks, government bodies, institutions (look for Inc, LLC, Ltd, Corp, LLP, etc.).
+- LOCATION: Cities, states, countries, addresses, geographic regions.
+- DATE: Specific dates, deadlines, time references.
+- AMOUNT: Any monetary value — numeric ($5,000,000) or written (Five Million Dollars). Also percentages.
+- AGREEMENT: Named contracts, agreements, legal documents, terms.
+- ASSET: Property, real estate, equipment, IP being transacted.
+- ROLE: Job titles, positions (CEO, Managing Director, Partner, Counsel).
+- DURATION: Time spans (30 days, 6 months, 2 years).
+- REGULATION: Laws, acts, regulatory requirements.
+- If none of the above fits, use the most descriptive type (PROJECT, EVENT, PRODUCT, ACCOUNT, CLAUSE, etc.).
+
+CRITICAL: 
+- "New York" is a LOCATION, not a PERSON.
+- "Five Million Dollars" is an AMOUNT, not a PERSON.
+- "Purchase Agreement" is an AGREEMENT, not a PERSON.
+- Job titles like "CEO" or "Managing Director" are ROLE, not PERSON.
 
 Return a JSON array where each item has: "type", "value", "confidence"
-
-Types:
-- PERSON: Every person's full name (e.g. "Rahul Deshmukh", "Vikram Joshi")
-- ORGANIZATION: Every company, firm, bank, government body (e.g. "Meridian Infrastructure Solutions Pvt. Ltd.", "HDFC Bank", "Deloitte India", "Pune Municipal Corporation", "GreenTech Engineering Services LLP", "Sharma Legal Associates")
-- DATE: Every date mentioned (e.g. "January 15, 2025")
-- AMOUNT: Every monetary value (e.g. "INR 45 crore")
-- LOCATION: Every city, state, country, area (e.g. "Pune", "Maharashtra", "Karnataka")
-- PROJECT: Every named project or initiative
-- INVOICE: Every invoice number
-- AGREEMENT: Every contract, agreement, or proposal name
-
-CRITICAL: Look carefully for ALL organizations including banks, law firms, government bodies, and consulting firms. Look for ALL people mentioned anywhere in the text.
 
 TEXT:
 {text}
@@ -192,46 +199,26 @@ Output ONLY a JSON array, nothing else:"""
                 for item in data:
                     if 'type' in item and 'value' in item:
                         # Standard format: {"type": "PERSON", "value": "John"}
-                        raw_type = item.get('type', 'unknown').lower()
-                        # Normalize synonymous types
-                        type_normalize = {
-                            'state': 'location', 'country': 'location', 'region': 'location',
-                            'city': 'location', 'place': 'location', 'area': 'location',
-                            'company': 'organization', 'org': 'organization', 'firm': 'organization',
-                            'bank': 'organization', 'institution': 'organization',
-                            'name': 'person', 'individual': 'person',
-                            'money': 'amount', 'currency': 'amount', 'cost': 'amount',
-                            'contract': 'agreement', 'proposal': 'agreement',
-                        }
-                        normalized_type = type_normalize.get(raw_type, raw_type)
+                        raw_type = item.get('type', 'unknown').strip().lower()
+                        value = str(item.get('value', '')).strip()
+                        if not value or len(value) < 2:
+                            continue
                         entity = Entity(
-                            type=normalized_type,
-                            value=item.get('value', ''),
+                            type=raw_type,
+                            value=value,
                             confidence=float(item.get('confidence', 0.9))
                         )
-                        if entity.value:
-                            entities.append(entity)
+                        entities.append(entity)
                     else:
                         # Alternative format: {"Person": "John", "Organization": "Acme"}
-                        type_map = {
-                            'person': 'person', 'name': 'person', 'individual': 'person',
-                            'organization': 'organization', 'company': 'organization', 'org': 'organization',
-                            'firm': 'organization', 'bank': 'organization', 'institution': 'organization',
-                            'date': 'date', 'amount': 'amount', 'money': 'amount', 'cost': 'amount',
-                            'location': 'location', 'place': 'location', 'city': 'location',
-                            'state': 'location', 'country': 'location', 'region': 'location', 'area': 'location',
-                            'project': 'project', 'invoice': 'invoice',
-                            'agreement': 'agreement', 'contract': 'agreement', 'proposal': 'agreement',
-                        }
                         for key, value in item.items():
-                            mapped_type = type_map.get(key.lower())
-                            if mapped_type and value:
-                                # Value could be a string or list
+                            entity_type = key.strip().lower()
+                            if value and entity_type not in ('confidence', 'score', 'source'):
                                 values = value if isinstance(value, list) else [value]
                                 for v in values:
-                                    if isinstance(v, str) and v.strip():
+                                    if isinstance(v, str) and len(v.strip()) >= 2:
                                         entities.append(Entity(
-                                            type=mapped_type,
+                                            type=entity_type,
                                             value=v.strip(),
                                             confidence=0.9
                                         ))
@@ -255,75 +242,29 @@ Output ONLY a JSON array, nothing else:"""
         - Organization names classified as Person
         """
         import re
-        from utils.domain_schema import identify_entity_type, ORG_INDICATORS, LOCATION_INDICATORS as LOC_IND
 
         validated = []
         for entity in entities:
             skip = False
             confidence = entity.confidence
 
-            # ── Step 2: Type Identification via domain schema ──────────
-            corrected_type = identify_entity_type(entity.value, entity.type.lower())
-            if corrected_type != entity.type.lower():
-                # Reclassify — keep value, change type, slight confidence penalty
-                entity = Entity(
-                    type=corrected_type,
-                    value=entity.value,
-                    confidence=max(0.60, confidence - 0.10),
-                )
-                confidence = entity.confidence
-
-            # ── Step 6: Confidence adjustments per type ────────────────
-            if entity.type.lower() == 'person':
-                # Check obvious non-person patterns
-                non_person_patterns = [
-                    r'(?i)(quarterly|performance|report|business|document|agreement|contract|terms)',
-                    r'\b(of|and|the|or|in|on|at)\b',
-                ]
-                for pattern in non_person_patterns:
-                    if re.search(pattern, entity.value):
-                        skip = True
-                        break
-
-                words = entity.value.split()
-                if len(words) > 4:
+            # ── Basic structural validation (no domain rules) ──────
+            value = entity.value.strip()
+            if not value or len(value) < 2:
+                continue
+            
+            entity_type = entity.type.lower().strip()
+            
+            # ── Minimal confidence adjustments ─────────────────────
+            if entity_type == 'person':
+                # Skip obvious non-person patterns (very generic)
+                if re.search(r'\b(of|and|the|or|in|on|at)\b', value.lower()):
                     skip = True
-                elif len(words) == 2:
-                    confidence = min(0.95, confidence + 0.05)
-                if not skip and len(words) == 1:
-                    confidence = max(0.3, confidence - 0.3)
-
-            elif entity.type.lower() == 'organization':
-                has_org_suffix = any(suffix in entity.value for suffix in
-                                    ['Corp', 'Inc', 'Ltd', 'LLC', 'Company', 'Group', 'Bank',
-                                     'Foundation', 'University', 'LLP', 'Services', 'Solutions',
-                                     'Associates', 'Municipal Corporation'])
-                words = entity.value.split()
-                if len(words) == 1 and not has_org_suffix:
-                    confidence = max(0.5, confidence - 0.2)
-                elif has_org_suffix:
-                    confidence = min(0.95, confidence + 0.1)
-
-            elif entity.type.lower() == 'location':
-                # Locations are generally fine; boost named places
-                confidence = min(0.95, confidence + 0.02)
-
-            elif entity.type.lower() == 'date':
-                date_patterns = [
-                    r'\d{4}-\d{2}-\d{2}',
-                    r'\d{1,2}/\d{1,2}/\d{4}',
-                    r'(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}',
-                ]
-                if any(re.search(p, entity.value, re.IGNORECASE) for p in date_patterns):
-                    confidence = min(0.98, confidence + 0.05)
-
-            elif entity.type.lower() == 'amount':
-                if re.search(r'(?:\$|INR|Rs)', entity.value, re.IGNORECASE):
-                    confidence = min(0.98, confidence + 0.05)
-
-            elif entity.type.lower() in ['project', 'invoice', 'agreement']:
-                if len(entity.value) > 2:
-                    confidence = min(0.95, confidence + 0.05)
+                words = value.split()
+                if len(words) > 5:
+                    skip = True
+                elif len(words) == 1:
+                    confidence = max(0.4, confidence - 0.2)
 
             if not skip:
                 entity.confidence = confidence
@@ -576,17 +517,8 @@ Output ONLY a JSON array, nothing else:"""
             if second.lower() in indian_states and first.lower() not in indian_states:
                 add("location", f"{m.group(1)}, {m.group(2)}", 0.88)
 
-        # ── Final pass: Apply domain-schema type reclassification ──────
-        from utils.domain_schema import identify_entity_type
-        final_entities: list[Entity] = []
-        for ent in collected.values():
-            corrected = identify_entity_type(ent.value, ent.type.lower())
-            if corrected != ent.type.lower():
-                ent = Entity(type=corrected, value=ent.value,
-                             confidence=max(0.55, ent.confidence - 0.10))
-            final_entities.append(ent)
-
-        return final_entities
+        # ── Return collected entities (no rule-based reclassification) ──
+        return list(collected.values())
 
     def _fallback_extract(self, text: str) -> ExtractionResult:
         """Rule-based extraction when LLM fails (regex-based)."""

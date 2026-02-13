@@ -201,6 +201,11 @@ class SemanticExtractor:
         raw_entities = self._extract_entities_per_chunk(chunks)
         print(f"  {len(raw_entities)} raw entity mentions across all chunks")
 
+        # ── Step 2.5: LLM-Based Entity Validation ─────────────────
+        print("\n▶ Step 2.5 — LLM-based entity validation agent …")
+        raw_entities = self._validate_entities_with_llm(raw_entities, text)
+        print(f"  {len(raw_entities)} entities after validation")
+
         # ── Step 3: Embedding-Based Entity Merging ─────────────────
         print("\n▶ Step 3 — Embedding-based entity deduplication …")
         merged_entities = self._merge_entities_by_embedding(raw_entities)
@@ -282,16 +287,37 @@ class SemanticExtractor:
     def _extract_from_single_chunk(
         self, chunk: SemanticChunk, llm: Any
     ) -> List[SemanticEntity]:
-        """Extract entities from one chunk using the LLM."""
-        prompt = f"""Extract ALL entities from this text segment. Return a JSON array.
-Each item: {{"type": "...", "value": "...", "confidence": 0.95}}
+        """Extract entities from one chunk using the LLM with dynamic type discovery."""
+        prompt = f"""You are a named entity recognition expert. Extract ALL meaningful entities from this text.
 
-Types: PERSON, ORGANIZATION, DATE, AMOUNT, LOCATION, PROJECT, INVOICE, AGREEMENT
+For EACH entity, you must:
+1. Identify the EXACT phrase from the text
+2. Classify it with the MOST SPECIFIC type that fits its real-world meaning
+3. Assign a confidence score (0.0 to 1.0)
 
-TEXT SEGMENT:
+CLASSIFICATION RULES (apply strictly):
+- A PERSON is ONLY a real human name (e.g. "John Smith"). Job titles, roles, pronouns, document terms are NOT persons.
+- An ORGANIZATION is a named company, firm, bank, government body, institution.
+- A LOCATION is a city, state, country, address, or geographic place.
+- A DATE is a specific date, deadline, or time reference.
+- An AMOUNT is any monetary value, whether numeric ("$25,000") or written ("Twenty-Five Million Dollars"). Include currency.
+- An INVOICE is a specific invoice identifier (e.g. "INV-78421", "Invoice #1234").
+- An AGREEMENT / CONTRACT is a named contract, agreement, or legal document.
+- A PERCENTAGE is any percentage value (e.g. "18%", "2%").
+- A TAX is a tax type or reference (e.g. "GST", "VAT", "Sales Tax").
+- If an entity doesn't fit the above, assign the most descriptive type (e.g. PROJECT, ROLE, REGULATION, CLAUSE, ASSET, ACCOUNT, PRODUCT, EVENT, DURATION, TERM, PENALTY, etc.)
+
+DO NOT extract:
+- Generic document structure words ("Section", "Article", "Clause" by themselves)
+- Pronouns or references ("this", "that", "the buyer")
+- Partial phrases that aren't meaningful standalone entities
+
+Return a JSON array. Each item: {{"type": "TYPE_IN_CAPS", "value": "exact text", "confidence": 0.95}}
+
+TEXT:
 {chunk.text}
 
-Return ONLY a JSON array:"""
+JSON array:"""
 
         try:
             if llm and hasattr(llm, "chat"):
@@ -311,28 +337,17 @@ Return ONLY a JSON array:"""
             if j_start == -1 or j_end <= j_start:
                 return self._regex_extract_chunk(chunk)
 
-            # Normalize types
-            type_normalize = {
-                'state': 'location', 'country': 'location', 'region': 'location',
-                'city': 'location', 'place': 'location', 'area': 'location',
-                'company': 'organization', 'org': 'organization', 'firm': 'organization',
-                'bank': 'organization', 'institution': 'organization',
-                'name': 'person', 'individual': 'person',
-                'money': 'amount', 'currency': 'amount', 'cost': 'amount',
-                'contract': 'agreement', 'proposal': 'agreement',
-            }
-
             data = json.loads(clean[j_start:j_end])
             entities: List[SemanticEntity] = []
             for item in data:
-                raw_type = str(item.get("type", "unknown")).lower()
-                norm_type = type_normalize.get(raw_type, raw_type)
+                raw_type = str(item.get("type", "unknown")).strip().lower()
                 value = str(item.get("value", "")).strip()
-                if not value:
+                if not value or len(value) < 2:
                     continue
-                conf = float(item.get("confidence", 0.9))
+                conf = float(item.get("confidence", 0.8))
+                
                 entities.append(SemanticEntity(
-                    type=norm_type,
+                    type=raw_type,
                     value=value,
                     confidence=conf,
                     source_chunks=[chunk.chunk_id],
@@ -342,6 +357,140 @@ Return ONLY a JSON array:"""
         except Exception:
             return self._regex_extract_chunk(chunk)
 
+    # ==================================================================
+    # STEP 2.5 — LLM-Based Entity Validation Agent
+    # ==================================================================
+
+    def _validate_entities_with_llm(
+        self, entities: List[SemanticEntity], text: str
+    ) -> List[SemanticEntity]:
+        """
+        Agentic LLM-based entity validation.
+
+        Instead of rule-based correction, we send the entire batch of
+        extracted entities back to the LLM along with the source text
+        and ask it to:
+          1. Verify each entity's type is correct
+          2. Reclassify mistyped entities
+          3. Remove junk / non-entity extractions
+          4. Merge obvious duplicates it can spot
+
+        This is fully dynamic — the LLM adapts to ANY domain (legal,
+        medical, finance, HR, engineering …) without hardcoded lists.
+        """
+        llm = self._get_llm()
+        if not llm or not hasattr(llm, "chat"):
+            return entities  # Can't validate without LLM
+
+        if not entities:
+            return entities
+
+        # Build a compact table for the LLM
+        entity_rows = []
+        for i, e in enumerate(entities):
+            entity_rows.append(f'{i}|{e.type}|{e.value}|{e.confidence:.2f}')
+        entity_table = '\n'.join(entity_rows)
+
+        # Use a truncated version of the text for context (first 2000 chars)
+        context_text = text[:2000] if len(text) > 2000 else text
+
+        prompt = f"""You are an entity validation agent. Below is a list of entities extracted from a document, and the source text for context.
+
+Your job:
+1. CHECK each entity's TYPE — is it correct given the entity value and document context?
+2. RECLASSIFY any entity whose type is wrong. Use the most specific, accurate type.
+3. REMOVE entities that are not real named entities (generic phrases, pronouns, structural terms).
+
+STRICT TYPE RULES:
+- PERSON: ONLY real human names (first + last name). NOT titles, roles, descriptions, document terms, or concepts.
+- ORGANIZATION: Named companies, firms, banks, institutions, government bodies.
+- LOCATION: Cities, states, countries, addresses, geographic regions.
+- DATE: Specific dates, deadlines, time periods, durations.
+- AMOUNT: Any monetary value — numeric ($5M) or written (Five Million Dollars). Include currency symbol/code.
+- INVOICE: Invoice identifiers (INV-1234, Invoice #5678). NOT the word "invoice" alone.
+- AGREEMENT: Named contracts, agreements, terms, clauses, legal documents.
+- PERCENTAGE: Percentage values (18%, 2%, 5.5%).
+- TAX: Tax types (GST, VAT, Sales Tax, Income Tax).
+- ASSET: Property, real estate, equipment, intellectual property being transacted.
+- ROLE: Job titles, positions, designations (CEO, Managing Director, etc.).
+- DURATION: Time spans (30 days, 6 months, 2 years).
+- REGULATION: Laws, acts, regulatory requirements.
+- TERM: Contractual terms, conditions, penalties, clauses.
+- Use any other specific type if none of the above fits (PROJECT, EVENT, PRODUCT, ACCOUNT, etc.).
+
+ENTITIES (index|current_type|value|confidence):
+{entity_table}
+
+SOURCE TEXT (for context):
+{context_text}
+
+Return a JSON array with the validated entities. For each entity return:
+{{"index": 0, "type": "CORRECT_TYPE", "value": "exact value", "keep": true}}
+
+Set "keep": false for entities that should be removed (not real entities).
+Only change "type" if the current type is WRONG.
+
+JSON array:"""
+
+        try:
+            raw = llm.chat(prompt)
+
+            # Parse response
+            clean = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+            if clean.startswith('```'):
+                lines = clean.split('\n')
+                lines = [l for l in lines if not l.strip().startswith('```')]
+                clean = '\n'.join(lines)
+
+            j_start = clean.find('[')
+            j_end = clean.rfind(']') + 1
+            if j_start == -1 or j_end <= j_start:
+                print("    ⚠ Validation agent returned unparseable response — keeping originals")
+                return entities
+
+            corrections = json.loads(clean[j_start:j_end])
+
+            # Build lookup from corrections
+            correction_map: Dict[int, Dict[str, Any]] = {}
+            for item in corrections:
+                idx = item.get("index")
+                if idx is not None:
+                    correction_map[int(idx)] = item
+
+            validated: List[SemanticEntity] = []
+            changed = 0
+            removed = 0
+
+            for i, entity in enumerate(entities):
+                corr = correction_map.get(i)
+                if corr is None:
+                    # Not in corrections → keep as-is
+                    validated.append(entity)
+                    continue
+
+                if not corr.get("keep", True):
+                    removed += 1
+                    continue
+
+                new_type = str(corr.get("type", entity.type)).strip().lower()
+                if new_type != entity.type:
+                    changed += 1
+                    entity.type = new_type
+
+                # Optionally update value if the LLM corrected it
+                new_value = corr.get("value", entity.value)
+                if new_value and len(str(new_value).strip()) >= 2:
+                    entity.value = str(new_value).strip()
+
+                validated.append(entity)
+
+            print(f"    Validation agent: {changed} types corrected, {removed} entities removed")
+            return validated
+
+        except Exception as e:
+            print(f"    ⚠ Validation agent error: {e} — keeping originals")
+            return entities
+
     def _regex_extract_chunk(self, chunk: SemanticChunk) -> List[SemanticEntity]:
         """Fallback regex extraction for a single chunk."""
         entities: List[SemanticEntity] = []
@@ -350,10 +499,7 @@ Return ONLY a JSON array:"""
         # Persons (two+ capitalized words)
         for m in re.finditer(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b', text):
             name = m.group(1)
-            # Filter out non-person capitalized phrases
-            skip_words = {'Smart City', 'Urban Road', 'Pune Municipal', 'Hinjewadi IT',
-                          'Chief Financial', 'Infrastructure Planning'}
-            if name not in skip_words and len(name.split()) <= 3:
+            if len(name.split()) <= 3:
                 entities.append(SemanticEntity(
                     type='person', value=name, confidence=0.7,
                     source_chunks=[chunk.chunk_id],
@@ -466,99 +612,146 @@ Return ONLY a JSON array:"""
         full_text: str,
     ) -> List[SemanticRelationship]:
         """
-        Discover relationships using production-grade validation:
-        
-        1. Find entity-pairs that co-occur in the same sentence/paragraph
-        2. Check for explicit verb/keyword evidence
-        3. Apply directional constraints
-        4. Compute deterministic confidence (not LLM-generated)
-        5. Only emit relationships with sufficient evidence
-        
-        This addresses:
-          - Relation explosion (overgeneration)
-          - Role leakage (person→org contamination)
-          - Symmetric relation duplication
-          - Flat/misleading confidence scores
+        Discover relationships using LLM — fully dynamic, works with any entity types.
+
+        Instead of hardcoded directional constraints, we send entity pairs
+        that co-occur in the same chunk context to the LLM and ask it to
+        identify relationships between them.
         """
-        from utils.relation_validator import (
-            RelationshipValidator,
-            entities_in_same_sentence,
-            find_evidence_for_relation,
-            CORE_RELATIONS,
-            DIRECTIONAL_CONSTRAINTS,
-        )
-        
-        validator = RelationshipValidator(
-            min_confidence=0.45,
-            require_same_sentence=False,  # Allow paragraph-level
-            require_evidence=True,         # Require keyword evidence
-        )
+        if not entities or len(entities) < 2:
+            return []
 
-        # Build entity lookup
-        entity_map = {e.value.lower(): e for e in entities}
-        relationships: List[SemanticRelationship] = []
-        seen_pairs: Set[Tuple[str, str, str]] = set()  # (src, tgt, rel)
+        llm = self._get_llm()
+        if not llm or not hasattr(llm, "chat"):
+            return []
 
-        # Process each entity pair
-        for i, e1 in enumerate(entities):
-            for j, e2 in enumerate(entities):
-                if i >= j:
+        # Build entity list for the prompt
+        entity_list = []
+        for i, e in enumerate(entities):
+            entity_list.append(f"{i}. [{e.type.upper()}] {e.value}")
+        entity_block = "\n".join(entity_list)
+
+        # Use truncated text for context
+        context_text = full_text[:3000] if len(full_text) > 3000 else full_text
+
+        prompt = f"""You are a relationship extraction expert for business documents. Given the entities and source document below, identify ALL meaningful relationships.
+
+ENTITIES:
+{entity_block}
+
+SOURCE TEXT:
+{context_text}
+
+DOCUMENT-AWARE RELATIONSHIP RULES:
+
+1. **INVOICES** — The invoice entity (e.g. INV-78421) is the CENTRAL node:
+   - Invoice → ISSUED_BY → Organization (the issuer/sender)
+   - Invoice → BILLED_TO → Organization (the recipient/buyer)
+   - Invoice → HAS_SUBTOTAL → Amount (subtotal before tax)
+   - Invoice → HAS_TAX → Amount (tax amount, GST, VAT)
+   - Invoice → HAS_TOTAL → Amount (total payable)
+   - Invoice → INVOICE_DATE → Date (the issue date)
+   - Invoice → DUE_DATE → Date (the payment deadline)
+   - Invoice → HAS_TAX_RATE → Percentage (tax rate like 18%)
+   - Invoice → HAS_PENALTY → Term/Percentage (late fees, penalties)
+   - Organization (issuer) → BILLS → Organization (recipient)
+
+2. **CONTRACTS / AGREEMENTS** — The agreement is the CENTRAL node:
+   - Agreement → SIGNED_BY → Person/Organization (each party)
+   - Agreement → EFFECTIVE_DATE → Date
+   - Agreement → EXPIRY_DATE → Date
+   - Agreement → HAS_VALUE → Amount (contract value)
+   - Agreement → GOVERNED_BY → Regulation/Location (jurisdiction)
+   - Person → PARTY_TO → Agreement
+   - Organization → PARTY_TO → Agreement
+
+3. **GENERAL RELATIONSHIPS** (use when appropriate):
+   - Person → WORKS_AT → Organization
+   - Organization → LOCATED_IN → Location
+   - Person → SIGNED_ON → Date
+   - Organization → OWNS → Asset
+   - Organization → SELLS_TO / SUPPLIES_TO → Organization
+
+CRITICAL RULES:
+- Dates DON'T "have values" of amounts. Amounts belong to invoices/agreements.
+- Always connect amounts and dates THROUGH the document entity (invoice/agreement), not directly to each other.
+- Differentiate between dates by their ROLE (invoice date vs due date vs effective date).
+- Differentiate between amounts by their ROLE (subtotal vs tax vs total).
+- Only extract relationships EXPLICITLY stated or strongly implied in the text.
+- Confidence: 0.85-0.95 for explicit, 0.70-0.84 for implied.
+
+Return a JSON array. Each item:
+{{"source": 0, "target": 1, "relationship": "RELATIONSHIP_TYPE", "confidence": 0.85}}
+
+Use entity index numbers for source and target.
+
+JSON array:"""
+
+        try:
+            raw = llm.chat(prompt)
+
+            # Parse response
+            clean = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+            if clean.startswith('```'):
+                lines = clean.split('\n')
+                lines = [l for l in lines if not l.strip().startswith('```')]
+                clean = '\n'.join(lines)
+
+            j_start = clean.find('[')
+            j_end = clean.rfind(']') + 1
+            if j_start == -1 or j_end <= j_start:
+                print("    ⚠ Relationship agent returned unparseable response")
+                return []
+
+            data = json.loads(clean[j_start:j_end])
+            relationships: List[SemanticRelationship] = []
+            seen: Set[Tuple[str, str, str]] = set()
+
+            for item in data:
+                src_idx = int(item.get("source", -1))
+                tgt_idx = int(item.get("target", -1))
+                rel_type = str(item.get("relationship", "RELATED_TO")).strip().upper()
+                conf = float(item.get("confidence", 0.7))
+
+                if src_idx < 0 or src_idx >= len(entities):
                     continue
-                # Skip same-type pairs for dates/amounts
-                if e1.type == e2.type and e1.type in ('date', 'amount'):
+                if tgt_idx < 0 or tgt_idx >= len(entities):
+                    continue
+                if src_idx == tgt_idx:
                     continue
 
-                # ── Determine valid relations for this type pair ──
-                candidate_rels = []
-                for rel, (allowed_src, allowed_tgt) in DIRECTIONAL_CONSTRAINTS.items():
-                    if e1.type == allowed_src and e2.type == allowed_tgt:
-                        candidate_rels.append((rel, e1, e2))
-                    elif e2.type == allowed_src and e1.type == allowed_tgt:
-                        candidate_rels.append((rel, e2, e1))
-                
-                # Also check symmetric relations
-                if e1.type == "organization" and e2.type == "organization":
-                    candidate_rels.append(("PARTNERS_WITH", e1, e2))
+                src_ent = entities[src_idx]
+                tgt_ent = entities[tgt_idx]
 
-                if not candidate_rels:
-                    continue  # No valid relations possible
+                key = (src_ent.value.lower(), tgt_ent.value.lower(), rel_type)
+                if key in seen:
+                    continue
+                seen.add(key)
 
-                # ── Validate each candidate relation ──
-                for rel_type, src_ent, tgt_ent in candidate_rels:
-                    # Skip if we've already seen this triple
-                    key = (src_ent.value.lower(), tgt_ent.value.lower(), rel_type)
-                    if key in seen_pairs:
-                        continue
+                # Compute semantic similarity
+                sem_score = 0.0
+                if src_ent.embedding and tgt_ent.embedding:
+                    a = np.array(src_ent.embedding, dtype=np.float32)
+                    b = np.array(tgt_ent.embedding, dtype=np.float32)
+                    sem_score = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
 
-                    result = validator.validate(
-                        source=src_ent.value,
-                        source_type=src_ent.type,
-                        target=tgt_ent.value,
-                        target_type=tgt_ent.type,
-                        proposed_relation=rel_type,
-                        full_text=full_text,
-                    )
+                relationships.append(SemanticRelationship(
+                    source=src_ent.value,
+                    source_type=src_ent.type,
+                    target=tgt_ent.value,
+                    target_type=tgt_ent.type,
+                    relationship=rel_type,
+                    confidence=round(conf, 3),
+                    evidence_chunks=[],
+                    semantic_score=round(sem_score, 3),
+                ))
 
-                    if result.is_valid:
-                        seen_pairs.add(key)
-                        
-                        # Compute semantic similarity for additional scoring
-                        sem_score = 0.0
-                        if src_ent.embedding and tgt_ent.embedding:
-                            a = np.array(src_ent.embedding, dtype=np.float32)
-                            b = np.array(tgt_ent.embedding, dtype=np.float32)
-                            sem_score = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
-                        
-                        relationships.append(SemanticRelationship(
-                            source=result.source,
-                            source_type=result.source_type,
-                            target=result.target,
-                            target_type=result.target_type,
-                            relationship=result.relation,
-                            confidence=round(result.confidence, 3),
-                            evidence_chunks=result.evidence_matches or [],
-                            semantic_score=round(sem_score, 3),
-                        ))
+            print(f"    LLM discovered {len(relationships)} relationships")
+            return relationships
+
+        except Exception as e:
+            print(f"    ⚠ Relationship discovery error: {e}")
+            return []
 
         return relationships
 

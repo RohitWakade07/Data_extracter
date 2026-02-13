@@ -720,48 +720,39 @@ class EnhancedRelationshipMapper:
         entities: List[Dict[str, Any]],
         relationships: List[MappedRelationship]
     ) -> str:
-        """Generate a direct answer to the query"""
-        query_lower = query.lower()
-        
-        # "Who works at X" type questions
-        if "who works" in query_lower or "employees" in query_lower:
-            # Find persons working at organizations
-            employees = []
-            for rel in relationships:
-                if rel.relationship_type in ["WORKS_AT", "EMPLOYED_BY"]:
-                    employees.append(rel.source)
-                elif rel.relationship_type == "EMPLOYS":
-                    employees.append(rel.target)
-            
-            if employees:
-                return f"Found {len(employees)} employee(s): {', '.join(set(employees))}"
-            
-            # Fallback to all persons
-            persons = [e.get('value', e.get('name', '')) for e in entities 
-                      if e.get('type', '').lower() == 'person']
-            if persons:
-                return f"People found: {', '.join(persons)}"
-        
-        # "Where is X located" type questions
-        if "where" in query_lower or "located" in query_lower:
-            locations = []
-            for rel in relationships:
-                if rel.relationship_type in ["LOCATED_IN", "BASED_IN"]:
-                    locations.append(f"{rel.source} is in {rel.target}")
-            
-            if locations:
-                return "; ".join(locations)
-        
-        # "Which companies" type questions
-        if "which companies" in query_lower or "companies affected" in query_lower:
-            companies = [e.get('value', e.get('name', '')) for e in entities 
-                        if e.get('type', '').lower() == 'organization']
-            if companies:
-                return f"Companies found: {', '.join(companies)}"
-        
-        # Generic answer
-        entity_summary = ", ".join([e.get('value', e.get('name', ''))[:30] for e in entities[:5]])
-        return f"Found {len(entities)} entities: {entity_summary}" + ("..." if len(entities) > 5 else "")
+        """Generate a direct answer using LLM — works for any query type."""
+        # Build context from entities and relationships
+        entity_list = "\n".join([
+            f"- {e.get('value', e.get('name', ''))} ({e.get('type', 'unknown')})"
+            for e in entities[:20]
+        ])
+        rel_list = "\n".join([
+            f"- {r.source} --[{r.relationship_type}]--> {r.target}"
+            for r in relationships[:15]
+        ])
+
+        try:
+            import os
+            from utils.ollama_handler import OllamaLLM
+            llm = OllamaLLM(model=os.getenv("OLLAMA_MODEL", "llama3"))
+
+            prompt = (
+                f'Based on the following extracted information, answer this question concisely:\n\n'
+                f'Question: "{query}"\n\n'
+                f'Entities found:\n{entity_list}\n\n'
+                f'Relationships found:\n{rel_list if rel_list else "(none found)"}\n\n'
+                f'Provide a brief, direct answer (1-3 sentences). '
+                f'Focus on specifically answering what was asked.'
+            )
+            answer = llm.chat(prompt)
+            return answer.strip()
+        except Exception as e:
+            print(f"⚠ LLM direct answer failed: {e}")
+            # Fallback to entity summary
+            entity_summary = ", ".join([
+                e.get('value', e.get('name', ''))[:30] for e in entities[:5]
+            ])
+            return f"Found {len(entities)} entities: {entity_summary}" + ("..." if len(entities) > 5 else "")
     
     def _generate_relationship_explanation(
         self,

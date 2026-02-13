@@ -212,6 +212,62 @@ class WeaviateClient:
             print(f"Get all documents error: {e}")
             return []
     
+    def delete_all_documents(self) -> Dict[str, Any]:
+        """Delete ALL documents from all Weaviate classes"""
+        if not self.client:
+            return {"success": False, "error": "Weaviate client not initialized", "deleted": 0}
+
+        deleted_count = 0
+        errors = []
+
+        for class_name in ["ExtractedDocument", "SemanticDocument"]:
+            try:
+                # Check if class exists
+                schema_resp = requests.get(f"{self.url}/v1/schema/{class_name}", timeout=10)
+                if schema_resp.status_code != 200:
+                    continue
+
+                # Fetch all objects of this class
+                graphql_query = {
+                    "query": f"""
+                    {{
+                        Get {{
+                            {class_name}(limit: 10000) {{
+                                _additional {{ id }}
+                            }}
+                        }}
+                    }}
+                    """
+                }
+                resp = requests.post(f"{self.url}/v1/graphql", json=graphql_query, timeout=30)
+                if resp.status_code != 200:
+                    errors.append(f"Failed to query {class_name}: {resp.text}")
+                    continue
+
+                data = resp.json()
+                docs = data.get("data", {}).get("Get", {}).get(class_name, [])
+
+                for doc in docs:
+                    uuid = doc.get("_additional", {}).get("id")
+                    if uuid:
+                        del_resp = requests.delete(
+                            f"{self.url}/v1/objects/{class_name}/{uuid}", timeout=10
+                        )
+                        if del_resp.status_code in [200, 204]:
+                            deleted_count += 1
+                        else:
+                            errors.append(f"Failed to delete {uuid}: {del_resp.status_code}")
+
+                print(f"Deleted {deleted_count} objects from {class_name}")
+            except Exception as e:
+                errors.append(f"Error clearing {class_name}: {str(e)}")
+
+        return {
+            "success": len(errors) == 0,
+            "deleted": deleted_count,
+            "errors": errors
+        }
+
     def close(self):
         """Close connection (no-op for REST client)"""
         pass

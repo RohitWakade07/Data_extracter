@@ -17,7 +17,6 @@ from agentic_workflow.workflow import run_workflow
 from vector_database.weaviate_handler import store_in_weaviate, Document
 from knowledge_graph.nebula_handler import store_in_nebula
 from utils.domain_schema import (
-    identify_entity_type,
     validate_relationship_triple,
     get_allowed_relationships,
     deduplicate_entities,
@@ -128,8 +127,12 @@ class IntegratedPipeline:
             {"type": e.type, "value": e.value, "confidence": e.confidence}
             for e in sem_result.entities
         ]
+        # Store phase-1 entities for later relationship filtering
+        self.results["_semantic_entities"] = list(entities)
         relationships = [
             {
+                "source": r.source,
+                "target": r.target,
                 "from_id": f"{r.source_type}_{r.source.replace(' ', '_')}",
                 "to_id": f"{r.target_type}_{r.target.replace(' ', '_')}",
                 "from_type": r.source_type,
@@ -156,7 +159,6 @@ class IntegratedPipeline:
             if isinstance(validated_entities[0], dict):
                 entities = validated_entities
             else:
-                # If it's in a different format, convert
                 entities = [
                     {"type": e.get("type", "unknown"), "value": e.get("value", e.get("name", "")), "confidence": e.get("confidence", 0.5)}
                     for e in validated_entities
@@ -165,39 +167,55 @@ class IntegratedPipeline:
         # Update stored entities with validated ones
         self.results["entities"] = entities
         
+        # Merge in any semantic-extraction entities that are missing from the
+        # workflow-validated set but are referenced in relationships.
+        # This ensures invoice IDs, tax entities, etc. don't get lost.
+        phase1_entities = self.results.get("_semantic_entities", [])
+        workflow_values = {e.get("value", e.get("name", "")).lower().strip() for e in entities}
+        for sem_e in phase1_entities:
+            sem_val = sem_e.get("value", "").lower().strip()
+            if sem_val and sem_val not in workflow_values:
+                # Check if this entity is referenced in any relationship
+                for rel in relationships:
+                    src = rel.get("source", "").lower().strip()
+                    tgt = rel.get("target", "").lower().strip()
+                    if sem_val == src or sem_val == tgt:
+                        entities.append(sem_e)
+                        workflow_values.add(sem_val)
+                        print(f"   Merged semantic entity into results: {sem_e.get('value')} ({sem_e.get('type')})")
+                        break
+        self.results["entities"] = entities
+        
         # Build set of validated entity names for relationship filtering
+        # Include BOTH workflow-validated entities AND semantic extraction entities
         validated_entity_names = set()
         for e in entities:
             name = e.get("value", e.get("name", ""))
             if name:
                 name_lower = name.lower().strip()
                 validated_entity_names.add(name_lower)
-                # Also add without periods and common variations
+                validated_entity_names.add(name_lower.replace(".", "").strip())
+                validated_entity_names.add(name_lower.replace(",", "").strip())
+        
+        # Also include entities from the semantic extraction (Phase 1)
+        # This prevents invoice IDs, tax types, etc. from being filtered out
+        sem_entities = self.results.get("semantic_extraction", {})
+        phase1_entities = self.results.get("_semantic_entities", [])
+        for e in phase1_entities:
+            name = e.get("value", e.get("name", ""))
+            if name:
+                name_lower = name.lower().strip()
+                validated_entity_names.add(name_lower)
                 validated_entity_names.add(name_lower.replace(".", "").strip())
                 validated_entity_names.add(name_lower.replace(",", "").strip())
         
         print(f"   Validated entity names for filtering: {validated_entity_names}")
         
-        # Import blocklists for relationship filtering
-        from utils.domain_schema import NON_ORG_BLOCKLIST, NON_PERSON_BLOCKLIST
-        
-        # Filter relationships to only include validated entity references
+        # Filter relationships — keep only those referencing validated entities
         filtered_relationships = []
         for rel in relationships:
             source = rel.get("source", "").lower().strip()
             target = rel.get("target", "").lower().strip()
-            
-            # Check if source or target is in blocklist - reject immediately
-            if source in NON_ORG_BLOCKLIST or source in NON_PERSON_BLOCKLIST:
-                continue
-            if target in NON_ORG_BLOCKLIST or target in NON_PERSON_BLOCKLIST:
-                continue
-            
-            # Check for common blocked patterns
-            blocked_patterns = ["the firm", "the business", "the partnership", "partnership firm", 
-                              "the company", "court", "the court", "the parties", "the partners"]
-            if any(pat in source for pat in blocked_patterns) or any(pat in target for pat in blocked_patterns):
-                continue
             
             # Keep relationship only if both source and target are validated entities
             source_valid = source in validated_entity_names or any(
@@ -259,16 +277,11 @@ class IntegratedPipeline:
             return f"{entity_type}_{clean}"
 
         # ══════════════════════════════════════════════════════════════
-        # LAYER 2 – TYPE IDENTIFICATION (reclassify wrong types)
+        # LAYER 2 – TYPE IDENTIFICATION
+        #   Entities are already validated by the LLM validation agent
+        #   in the agentic workflow. No rule-based reclassification needed.
         # ══════════════════════════════════════════════════════════════
-        reclassified_count = 0
-        for e in entities:
-            old_type = e.get("type", "unknown").lower()
-            new_type = identify_entity_type(e.get("value", ""), old_type)
-            if new_type != old_type:
-                reclassified_count += 1
-                e["type"] = new_type
-                e["confidence"] = max(0.55, e.get("confidence", 0.5) - 0.10)
+        reclassified_count = 0  # Types already validated by LLM agent
 
         # ══════════════════════════════════════════════════════════════
         # LAYER 6a – ENTITY DEDUPLICATION (merge similar entities)

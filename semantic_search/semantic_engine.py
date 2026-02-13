@@ -5,6 +5,7 @@
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 import json
+import re
 import requests
 import os
 
@@ -38,8 +39,21 @@ class SemanticSearchEngine:
     ):
         self.url = weaviate_url.rstrip('/')
         self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
+        self._llm = None
         self.client = self._initialize_client()
-        
+
+    def _get_llm(self):
+        """Lazy-load LLM for dynamic query operations."""
+        if self._llm is not None:
+            return self._llm
+        try:
+            from utils.ollama_handler import OllamaLLM
+            model = os.getenv("OLLAMA_MODEL", "llama3")
+            self._llm = OllamaLLM(model=model)
+            return self._llm
+        except Exception:
+            return None
+
     def _initialize_client(self) -> bool:
         """Initialize and verify Weaviate connection"""
         try:
@@ -209,30 +223,42 @@ class SemanticSearchEngine:
         content: str, 
         entities: Optional[List[Dict[str, Any]]] = None
     ) -> List[str]:
-        """Extract keywords from content and entities for hybrid search"""
+        """Dynamically extract keywords from any content — domain agnostic."""
         keywords = set()
-        
+
         # Add entity values as keywords
         if entities:
             for entity in entities:
                 value = entity.get('value') or entity.get('name', '')
                 if value:
                     keywords.add(value.lower())
-        
-        # Add important domain terms from content
-        supply_chain_terms = [
-            'shipment', 'delay', 'congestion', 'logistics', 'supplier',
-            'port', 'customs', 'warehouse', 'delivery', 'freight',
-            'cargo', 'inventory', 'procurement', 'vendor', 'transport',
-            'distribution', 'bottleneck', 'disruption', 'backlog'
-        ]
-        
-        content_lower = content.lower()
-        for term in supply_chain_terms:
-            if term in content_lower:
-                keywords.add(term)
-        
-        return list(keywords)[:20]  # Limit to 20 keywords
+
+        # Frequency-based keyword extraction (works for ANY domain)
+        stop_words = {
+            'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+            'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+            'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'to', 'of',
+            'for', 'with', 'about', 'between', 'into', 'through', 'during', 'before',
+            'after', 'from', 'up', 'down', 'out', 'off', 'over', 'under', 'this',
+            'that', 'these', 'those', 'then', 'than', 'also', 'and', 'but', 'or',
+            'not', 'its', 'at', 'by', 'as', 'on', 'in', 'so', 'if', 'any', 'all',
+            'each', 'own', 'very', 'such', 'same', 'just', 'more', 'most', 'some',
+            'set', 'forth', 'herein', 'shall', 'upon', 'within'
+        }
+
+        words = content.lower().split()
+        word_freq: Dict[str, int] = {}
+        for w in words:
+            w = w.strip('.,;:!?()[]{}"\'-/*\\')
+            if len(w) > 3 and w not in stop_words and not w.isdigit():
+                word_freq[w] = word_freq.get(w, 0) + 1
+
+        sorted_words = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)
+        for word, freq in sorted_words[:15]:
+            if freq >= 2:
+                keywords.add(word)
+
+        return list(keywords)[:20]
     
     def semantic_search(
         self,
@@ -493,141 +519,54 @@ class SemanticSearchEngine:
 
     def _expand_query_semantically(self, query: str) -> List[str]:
         """
-        Expand query with synonyms and related terms for semantic-like matching.
-        
-        This is the key to achieving semantic search without vector embeddings.
+        Dynamically expand query using LLM — works for ANY domain.
+
+        Uses the LLM to generate synonyms, related terms, and domain-specific
+        keywords for the given query. Falls back to basic term extraction
+        if the LLM is unavailable.
         """
-        # Semantic relationships (synonyms and related concepts)
-        semantic_expansions = {
-            # Shipment/Delay concepts
-            'delay': ['delayed', 'congestion', 'bottleneck', 'backlog', 'hold', 'stuck', 'waiting', 'late', 'overdue', 'slow'],
-            'delayed': ['delay', 'congestion', 'bottleneck', 'held', 'stuck'],
-            'shipment': ['cargo', 'freight', 'delivery', 'package', 'consignment', 'goods', 'transport', 'shipping'],
-            'shipping': ['shipment', 'cargo', 'freight', 'delivery', 'transport', 'logistics'],
-            'congestion': ['overcrowding', 'traffic', 'blockage', 'jam', 'queue', 'pile-up', 'bottleneck', 'delay'],
-            'bottleneck': ['congestion', 'constraint', 'delay', 'blockage', 'slowdown'],
-            
-            # Weather/Natural events
-            'weather': ['rain', 'rainfall', 'storm', 'flood', 'monsoon', 'cyclone', 'hurricane', 'climate', 'natural'],
-            'rain': ['rainfall', 'precipitation', 'monsoon', 'downpour', 'shower', 'wet', 'flooding'],
-            'rainfall': ['rain', 'precipitation', 'monsoon', 'weather'],
-            'flood': ['flooding', 'inundation', 'rain', 'monsoon', 'water'],
-            
-            # Supply chain
-            'supply': ['supplier', 'procurement', 'sourcing', 'vendor', 'provision', 'stock'],
-            'chain': ['supply chain', 'logistics', 'network', 'pipeline'],
-            'logistics': ['transport', 'shipping', 'freight', 'warehouse', 'distribution', 'delivery', 'supply chain'],
-            'supplier': ['vendor', 'provider', 'source', 'manufacturer', 'partner'],
-            
-            # Location concepts  
-            'port': ['harbor', 'dock', 'terminal', 'wharf', 'pier', 'seaport', 'maritime'],
-            'customs': ['clearance', 'inspection', 'duty', 'tariff', 'import', 'export', 'border'],
-            
-            # Incident/Security concepts
-            'cyber': ['security', 'breach', 'hack', 'attack', 'vulnerability', 'malware', 'digital'],
-            'attack': ['breach', 'intrusion', 'exploit', 'compromise', 'incident', 'hack'],
-            'security': ['cyber', 'breach', 'protection', 'vulnerability', 'safety'],
-            'breach': ['attack', 'hack', 'intrusion', 'compromise', 'leak', 'security'],
-            'cloud': ['aws', 'azure', 'gcp', 'infrastructure', 'server', 'saas', 'iaas', 'hosting'],
-            
-            # Business/Impact concepts
-            'company': ['organization', 'firm', 'corporation', 'enterprise', 'business', 'vendor'],
-            'companies': ['organizations', 'firms', 'corporations', 'enterprises', 'businesses'],
-            'affected': ['impacted', 'influenced', 'disrupted', 'hit', 'suffered', 'experienced'],
-            'impact': ['affect', 'influence', 'disrupt', 'effect', 'consequence'],
-            'disruption': ['disrupted', 'interruption', 'breakdown', 'failure', 'stoppage'],
-            
-            # BUSINESS DOCUMENT EXPANSIONS
-            # People/Employment
-            'works': ['employed', 'working', 'employee', 'staff', 'team', 'member', 'personnel'],
-            'employee': ['staff', 'worker', 'personnel', 'team member', 'associate', 'employed'],
-            'staff': ['employee', 'worker', 'personnel', 'team', 'workforce'],
-            'manager': ['lead', 'head', 'director', 'supervisor', 'chief', 'executive'],
-            'director': ['manager', 'head', 'chief', 'executive', 'lead', 'officer'],
-            'ceo': ['chief executive', 'president', 'head', 'director', 'leader', 'founder'],
-            'founder': ['creator', 'owner', 'entrepreneur', 'ceo', 'established'],
-            
-            # Company/Organization
-            'mahindra': ['tech mahindra', 'mahindra group', 'mahindra & mahindra', 'm&m'],
-            'tata': ['tata group', 'tcs', 'tata consultancy', 'tata motors', 'tata steel'],
-            'reliance': ['reliance industries', 'jio', 'reliance retail', 'ril'],
-            'infosys': ['infy', 'infosys technologies', 'infosys limited'],
-            'wipro': ['wipro technologies', 'wipro limited'],
-            
-            # Contract/Legal terms
-            'contract': ['agreement', 'deal', 'terms', 'engagement', 'arrangement', 'pact'],
-            'agreement': ['contract', 'deal', 'terms', 'understanding', 'arrangement', 'mou'],
-            'invoice': ['bill', 'receipt', 'payment', 'billing', 'charge', 'amount due'],
-            'payment': ['pay', 'remittance', 'transaction', 'settlement', 'amount', 'fee'],
-            'terms': ['conditions', 'clauses', 'provisions', 'stipulations', 'requirements'],
-            'legal': ['law', 'contract', 'compliance', 'regulation', 'statutory', 'binding'],
-            
-            # Project/Work
-            'project': ['initiative', 'program', 'engagement', 'assignment', 'work', 'task'],
-            'initiative': ['project', 'program', 'effort', 'drive', 'campaign'],
-            'deliverable': ['output', 'result', 'milestone', 'product', 'completion'],
-            'deadline': ['due date', 'timeline', 'schedule', 'target date', 'completion date'],
-            
-            # Financial terms
-            'revenue': ['income', 'sales', 'earnings', 'turnover', 'receipts'],
-            'cost': ['expense', 'expenditure', 'spending', 'outlay', 'price'],
-            'profit': ['gain', 'earnings', 'margin', 'return', 'surplus'],
-            'budget': ['allocation', 'funds', 'funding', 'financial plan', 'appropriation'],
-            'investment': ['funding', 'capital', 'stake', 'financing', 'injection'],
-            
-            # Roles/Positions
-            'lead': ['head', 'manager', 'chief', 'principal', 'senior'],
-            'senior': ['lead', 'principal', 'chief', 'head', 'experienced'],
-            'consultant': ['advisor', 'specialist', 'expert', 'professional'],
-            'analyst': ['researcher', 'specialist', 'examiner', 'evaluator'],
-            'engineer': ['developer', 'technical', 'specialist', 'programmer'],
-            
-            # Question words - expand to related concepts
-            'who': ['person', 'employee', 'staff', 'individual', 'member', 'name'],
-            'works': ['employed', 'working', 'employee', 'job', 'position', 'role'],
-            'work': ['employed', 'job', 'position', 'role', 'occupation'],
-            'why': ['cause', 'reason', 'because', 'due'],
-            'which': ['what', 'who', 'that'],
-            'how': ['way', 'method', 'process'],
-            'what': ['which', 'details', 'information', 'specifics'],
-            'where': ['location', 'place', 'site', 'address', 'office'],
-            'when': ['date', 'time', 'period', 'timeline', 'schedule'],
+        original_terms = [t for t in query.lower().split() if len(t) > 2]
+        expanded = set(original_terms)
+
+        # ── LLM-based expansion (dynamic, domain-agnostic) ──
+        try:
+            llm = self._get_llm()
+            if llm:
+                prompt = (
+                    f'Given the search query: "{query}"\n'
+                    'Generate 8-12 related search keywords and phrases that would help '
+                    'find relevant documents in a database. Include synonyms, related '
+                    'concepts, domain terms, and entity names implied by the query.\n'
+                    'Return ONLY a JSON array of lowercase strings.\n'
+                    'Example: ["term1", "term2", "related phrase"]\n'
+                    'No explanation, just the JSON array.'
+                )
+                raw = llm.chat(prompt)
+                match = re.search(r'\[.*?\]', raw, re.DOTALL)
+                if match:
+                    terms = json.loads(match.group())
+                    for t in terms:
+                        if isinstance(t, str) and len(t.strip()) > 2:
+                            expanded.add(t.lower().strip())
+                    print(f"  ✓ LLM expanded query with {len(terms)} terms")
+        except Exception as e:
+            print(f"  ⚠ LLM query expansion fallback: {e}")
+
+        # ── Filter stop words ──
+        stop_words = {
+            'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+            'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+            'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'to', 'of',
+            'for', 'with', 'about', 'between', 'into', 'through', 'during',
+            'before', 'after', 'from', 'up', 'down', 'out', 'off', 'over',
+            'under', 'again', 'then', 'once', 'here', 'there', 'all', 'each',
+            'few', 'more', 'most', 'other', 'some', 'such', 'only', 'own',
+            'same', 'so', 'than', 'too', 'very', 'just', 'also', 'and', 'but',
+            'or', 'not', 'this', 'that', 'what', 'which', 'who', 'how', 'why',
+            'when', 'where'
         }
-        
-        # Start with original query terms - these are MOST important
-        query_lower = query.lower()
-        original_terms = query_lower.split()
-        
-        # Use a priority system: original terms get boosted
-        expanded_terms = set()
-        
-        # Add original terms with high priority (will appear first in search)
-        for term in original_terms:
-            if len(term) > 2:  # Skip very short words like 'in', 'at'
-                expanded_terms.add(term)
-        
-        # Add ONLY direct semantic expansions (no partial matching)
-        # This prevents "company" from pulling in weather-related terms
-        for term in original_terms:
-            if term in semantic_expansions:
-                # Only add most relevant expansions (limit to 3)
-                relevant_expansions = semantic_expansions[term][:3]
-                expanded_terms.update(relevant_expansions)
-        
-        # Filter out common words that don't help search
-        stop_words = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
-                      'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
-                      'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'dare',
-                      'ought', 'used', 'to', 'of', 'for', 'with', 'about', 'against',
-                      'between', 'into', 'through', 'during', 'before', 'after', 'above',
-                      'below', 'from', 'up', 'down', 'out', 'off', 'over', 'under', 'again',
-                      'further', 'then', 'once', 'here', 'there', 'all', 'each', 'few',
-                      'more', 'most', 'other', 'some', 'such', 'only', 'own', 'same', 'so',
-                      'than', 'too', 'very', 'just', 'also'}
-        
-        expanded_terms = {t for t in expanded_terms if t not in stop_words}
-        
-        return list(expanded_terms)
+        expanded = {t for t in expanded if t not in stop_words}
+        return list(expanded)
     
     def _fallback_search(self, query: str, limit: int = 10) -> List[SearchResult]:
         """Fallback to basic text search when vector search unavailable"""
@@ -769,56 +708,28 @@ class SemanticSearchEngine:
             return []
     
     def _is_semantically_related(
-        self, 
-        query: str, 
-        content: str, 
+        self,
+        query: str,
+        content: str,
         entities: str
     ) -> bool:
-        """Check if content is semantically related to query using synonym mapping"""
-        
-        # Define semantic relationships (synonyms and related concepts)
-        semantic_map = {
-            # Shipment/Delay concepts
-            'delay': ['congestion', 'bottleneck', 'backlog', 'hold', 'stuck', 'waiting', 'late', 'overdue'],
-            'shipment': ['cargo', 'freight', 'delivery', 'package', 'consignment', 'goods', 'transport'],
-            'congestion': ['overcrowding', 'traffic', 'blockage', 'jam', 'queue', 'pile-up'],
-            
-            # Weather/Natural events
-            'weather': ['rain', 'rainfall', 'storm', 'flood', 'monsoon', 'cyclone', 'hurricane', 'climate'],
-            'rain': ['rainfall', 'precipitation', 'monsoon', 'downpour', 'shower', 'wet'],
-            
-            # Supply chain
-            'supply chain': ['logistics', 'procurement', 'sourcing', 'vendor', 'supplier', 'distribution'],
-            'logistics': ['transport', 'shipping', 'freight', 'warehouse', 'distribution', 'delivery'],
-            
-            # Location concepts  
-            'port': ['harbor', 'dock', 'terminal', 'wharf', 'pier', 'seaport'],
-            'customs': ['clearance', 'inspection', 'duty', 'tariff', 'import', 'export'],
-            
-            # Incident/Security concepts
-            'cyber': ['security', 'breach', 'hack', 'attack', 'vulnerability', 'malware'],
-            'attack': ['breach', 'intrusion', 'exploit', 'compromise', 'incident'],
-            'cloud': ['aws', 'azure', 'gcp', 'infrastructure', 'server', 'saas', 'iaas'],
-            
-            # Business concepts
-            'company': ['organization', 'firm', 'corporation', 'enterprise', 'business'],
-            'affected': ['impacted', 'influenced', 'disrupted', 'hit', 'suffered'],
-        }
-        
-        combined_text = f"{content} {entities}"
-        query_terms = query.split()
-        
+        """Check if content is semantically related to query — domain agnostic."""
+        combined = f"{content} {entities}"
+        query_terms = [t for t in query.split() if len(t) > 2]
+
+        if not query_terms:
+            return True  # Empty query matches everything
+
+        # Direct keyword match
         for term in query_terms:
-            # Direct match
-            if term in combined_text:
+            if term in combined:
                 return True
-            
-            # Synonym match
-            related_terms = semantic_map.get(term, [])
-            for related in related_terms:
-                if related in combined_text:
-                    return True
-        
+
+        # Significant overlap check (>30 % of meaningful query terms found)
+        matches = sum(1 for t in query_terms if t in combined)
+        if matches / len(query_terms) > 0.3:
+            return True
+
         return False
     
     def _extract_highlights(self, content: str, query: str) -> List[str]:
@@ -845,6 +756,47 @@ class SemanticSearchEngine:
         # Return top 3 most relevant highlights
         return highlights[:3]
     
+    def generate_answer_from_results(
+        self,
+        query: str,
+        results: List[SearchResult]
+    ) -> str:
+        """Use LLM to synthesise a comprehensive answer from search results."""
+        if not results:
+            return "No relevant documents found for your query."
+
+        # Build context from top results
+        context_parts = []
+        for i, r in enumerate(results[:3], 1):
+            preview = r.content[:600] if len(r.content) > 600 else r.content
+            context_parts.append(f"Document {i}:\n{preview}")
+        context = "\n\n".join(context_parts)
+
+        try:
+            llm = self._get_llm()
+            if llm:
+                prompt = (
+                    f'Based on the following documents, answer this question:\n'
+                    f'Question: "{query}"\n\n'
+                    f'{context}\n\n'
+                    f'Provide a clear, concise answer (2-5 sentences) based ONLY on '
+                    f'the information in the documents above. '
+                    f'If the documents do not contain relevant information, say so honestly.'
+                )
+                answer = llm.chat(prompt)
+                return answer.strip()
+        except Exception as e:
+            print(f"⚠ LLM answer generation failed: {e}")
+
+        # Fallback to highlight extraction
+        highlights = []
+        for r in results[:3]:
+            if r.highlights:
+                highlights.extend(r.highlights[:2])
+        if highlights:
+            return "\n".join([f"• {h}" for h in highlights])
+        return "Results found. See documents below for details."
+
     def hybrid_search(
         self,
         query: str,

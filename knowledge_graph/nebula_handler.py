@@ -5,7 +5,7 @@ import json
 import time
 
 # Entity type mapping for consistent tagging
-# Extended with supply chain, incident, and event types
+# Extended with invoice, contract, supply chain, incident, and event types
 ENTITY_TAG_MAP = {
     # Core entities
     "person": "Person",
@@ -16,6 +16,18 @@ ENTITY_TAG_MAP = {
     "project": "Project",
     "invoice": "Invoice",
     "agreement": "Agreement",
+    "contract": "Agreement",
+    
+    # Financial / Document entities
+    "percentage": "Percentage",
+    "tax": "Tax",
+    "term": "Term",
+    "penalty": "Penalty",
+    "duration": "Duration",
+    "role": "Role",
+    "asset": "Asset",
+    "regulation": "Regulation",
+    "clause": "Clause",
     
     # Supply chain entities
     "shipment": "Shipment",
@@ -40,24 +52,50 @@ ENTITY_TAG_MAP = {
     "route": "Route"
 }
 
-# Relationship mapping rules - Extended for supply chain intelligence
+# Relationship mapping rules - Extended for invoices, contracts, and supply chain
 RELATIONSHIP_MAP = {
-    # Existing relationships
+    # Invoice relationships (Invoice is central node)
+    ("Invoice", "Organization"): "ISSUED_BY",
+    ("Organization", "Invoice"): "RECEIVES",
+    ("Invoice", "Amount"): "HAS_TOTAL",
+    ("Invoice", "Date"): "INVOICE_DATE",
+    ("Invoice", "Percentage"): "HAS_TAX_RATE",
+    ("Invoice", "Tax"): "HAS_TAX_TYPE",
+    ("Invoice", "Term"): "HAS_TERM",
+    ("Invoice", "Penalty"): "HAS_PENALTY",
+    
+    # Agreement / Contract relationships (Agreement is central node)
+    ("Agreement", "Organization"): "SIGNED_BY",
+    ("Agreement", "Person"): "SIGNED_BY",
+    ("Agreement", "Date"): "EFFECTIVE_DATE",
+    ("Agreement", "Amount"): "HAS_VALUE",
+    ("Agreement", "Location"): "GOVERNED_BY",
+    ("Agreement", "Regulation"): "GOVERNED_BY",
+    ("Agreement", "Clause"): "CONTAINS",
+    ("Agreement", "Term"): "HAS_TERM",
+    ("Agreement", "Asset"): "COVERS",
+    ("Person", "Agreement"): "PARTY_TO",
+    ("Organization", "Agreement"): "PARTY_TO",
+    
+    # Person-Org relationships
     ("Person", "Organization"): "WORKS_AT",
     ("Person", "Location"): "LOCATED_IN",
     ("Person", "Date"): "SIGNED_ON",
+    ("Person", "Role"): "HAS_ROLE",
+    
+    # Org relationships
     ("Organization", "Location"): "LOCATED_IN",
     ("Organization", "Amount"): "HAS_AMOUNT",
+    ("Organization", "Organization"): "TRANSACTS_WITH",
+    
+    # Financial relationships
     ("Amount", "Date"): "EFFECTIVE_ON",
+    ("Tax", "Percentage"): "HAS_RATE",
+    ("Tax", "Amount"): "HAS_AMOUNT",
+    
+    # Project relationships
     ("Person", "Project"): "WORKS_ON",
     ("Organization", "Project"): "MANAGES",
-    ("Organization", "Invoice"): "ISSUED",
-    ("Invoice", "Organization"): "BILLED_TO",
-    ("Organization", "Agreement"): "PARTY_TO",
-    ("Agreement", "Date"): "SIGNED_ON",
-    ("Agreement", "Amount"): "HAS_VALUE",
-    ("Invoice", "Amount"): "HAS_AMOUNT",
-    ("Invoice", "Date"): "DUE_ON",
     ("Project", "Location"): "LOCATED_IN",
     
     # Supply chain relationships
@@ -217,6 +255,77 @@ class NebulaGraphClient:
 
             session.execute("""
                 CREATE TAG IF NOT EXISTS Agreement(
+                    name string,
+                    confidence float
+                )
+            """)
+
+            # ----------------- FINANCIAL / DOCUMENT TAGS -----------------
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Percentage(
+                    value string,
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Tax(
+                    name string,
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Term(
+                    name string,
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Penalty(
+                    name string,
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Duration(
+                    value string,
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Role(
+                    name string,
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Asset(
+                    name string,
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Regulation(
+                    name string,
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Clause(
+                    name string,
+                    confidence float
+                )
+            """)
+
+            session.execute("""
+                CREATE TAG IF NOT EXISTS Product(
                     name string,
                     confidence float
                 )
@@ -547,6 +656,7 @@ class NebulaGraphClient:
             # Create tag indexes for LOOKUP queries to work - Extended list
             tag_types = [
                 'Person', 'Organization', 'Location', 'Project', 'Invoice', 'Agreement', 'Amount', 'Date',
+                'Percentage', 'Tax', 'Term', 'Penalty', 'Duration', 'Role', 'Asset', 'Regulation', 'Clause', 'Product',
                 'Shipment', 'Port', 'Supplier', 'Customer', 'LogisticsPartner', 'Warehouse', 'Cargo',
                 'Event', 'Incident', 'Delay', 'Congestion', 'WeatherEvent', 'Disruption', 'Category', 'Route'
             ]
@@ -560,6 +670,10 @@ class NebulaGraphClient:
             edge_types = [
                 'WORKS_AT', 'LOCATED_IN', 'LOCATED_AT', 'WORKS_ON', 'MANAGES', 'PARTY_TO', 
                 'SIGNED_ON', 'HAS_AMOUNT', 'EFFECTIVE_ON', 'HAS_VALUE', 'ISSUED', 'DUE_ON', 'BILLED_TO',
+                'ISSUED_BY', 'RECEIVES', 'HAS_TOTAL', 'HAS_SUBTOTAL', 'HAS_TAX', 'INVOICE_DATE',
+                'DUE_DATE', 'HAS_TAX_RATE', 'HAS_TAX_TYPE', 'HAS_TERM', 'HAS_PENALTY', 'BILLS',
+                'SIGNED_BY', 'EFFECTIVE_DATE', 'EXPIRY_DATE', 'GOVERNED_BY', 'CONTAINS', 'COVERS',
+                'TRANSACTS_WITH', 'HAS_ROLE', 'HAS_RATE',
                 'SENT', 'RECEIVED_BY', 'ROUTED_THROUGH', 'SUPPLIED_BY', 'SUPPLIES_TO', 'SELLS_TO',
                 'USES_LOGISTICS', 'OPERATES_AT', 'PASSES_THROUGH', 'PART_OF',
                 'EXPERIENCED', 'CAUSED_BY', 'HAS', 'AFFECTED', 'IMPACTED', 'DISRUPTED', 'BELONGS_TO',
@@ -599,6 +713,49 @@ class NebulaGraphClient:
             session.release()
 
     # ------------------------------------------------------------------
+    # Data Deletion
+    # ------------------------------------------------------------------
+
+    def clear_all_data(self) -> Dict[str, Any]:
+        """Delete ALL vertices and edges from the graph space by dropping and recreating it."""
+        session = self._get_session()
+        if not session:
+            return {"success": False, "error": "NebulaGraph session not available", "deleted_vertices": 0, "deleted_edges": 0}
+
+        try:
+            # Get counts before clearing
+            stats = self.get_graph_stats()
+            v_count = stats.get("entities", 0)
+            e_count = stats.get("relationships", 0)
+
+            # Drop the entire space and recreate it
+            session.execute(f"DROP SPACE IF EXISTS {self.space}")
+            time.sleep(2)  # Wait for space to be dropped
+            session.release()
+
+            # Reset dynamic tracking
+            self._dynamic_tags = set()
+            self._dynamic_edges = set()
+
+            # Recreate the space with full schema
+            self.create_space()
+
+            print(f"Cleared NebulaGraph: {v_count} vertices, {e_count} edges removed")
+            return {
+                "success": True,
+                "deleted_vertices": v_count,
+                "deleted_edges": e_count,
+            }
+
+        except Exception as e:
+            print(f"Clear all data error: {e}")
+            try:
+                session.release()
+            except Exception:
+                pass
+            return {"success": False, "error": str(e), "deleted_vertices": 0, "deleted_edges": 0}
+
+    # ------------------------------------------------------------------
     # Data Insertion
     # ------------------------------------------------------------------
 
@@ -606,7 +763,7 @@ class NebulaGraphClient:
         """Dynamically create a tag if it doesn't exist yet."""
         if tag in self._dynamic_tags:
             return
-        if tag in ["Date", "Amount"]:
+        if tag in ["Date", "Amount", "Percentage", "Duration"]:
             session.execute(
                 f'CREATE TAG IF NOT EXISTS `{tag}`(value string, confidence float)'
             )
@@ -654,7 +811,7 @@ class NebulaGraphClient:
             clean_value = clean_value.replace('"', '\\"')
 
             # Handle different tag schemas based on tag type
-            if tag in ["Date", "Amount"]:
+            if tag in ["Date", "Amount", "Percentage", "Duration"]:
                 query = (
                     f'INSERT VERTEX `{tag}`(value, confidence) '
                     f'VALUES "{entity_id}":("{clean_value}", {confidence})'
@@ -723,13 +880,17 @@ class NebulaGraphClient:
             
             edge = relationship_type.upper()
 
+            # Pre-ensure the edge type exists before attempting insert
+            self._ensure_edge_exists(session, edge)
+            time.sleep(0.5)
+
             query = (
                 f'INSERT EDGE `{edge}`(confidence) '
                 f'VALUES "{from_id}"->"{to_id}":({confidence})'
             )
 
             # Retry logic with dynamic edge creation
-            max_retries = 3
+            max_retries = 4
             for attempt in range(max_retries):
                 result = session.execute(query)
 
@@ -743,12 +904,12 @@ class NebulaGraphClient:
                 if "EdgeNotFound" in error_msg:
                     print(f"   Auto-creating edge type `{edge}` …")
                     self._ensure_edge_exists(session, edge)
-                    time.sleep(1)  # let schema propagate
+                    time.sleep(2)  # longer wait for schema propagation
                     try:
                         session.execute(f"REBUILD EDGE INDEX idx_{edge.lower()}")
                     except Exception:
                         pass
-                    time.sleep(1)
+                    time.sleep(2)
                     # retry immediately
                     result = session.execute(query)
                     if result.is_succeeded():

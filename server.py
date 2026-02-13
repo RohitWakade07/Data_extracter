@@ -141,10 +141,18 @@ def upload_file():
         ]
         # Get relationships and transform to frontend format
         raw_relationships = results.get('relationships', [])
+        def _strip_type_prefix(id_str):
+            """Dynamically strip type prefix (e.g. 'person_john_doe' -> 'john doe')"""
+            if not id_str:
+                return ''
+            if '_' in id_str:
+                return '_'.join(id_str.split('_')[1:]).replace('_', ' ')
+            return id_str
+        
         extracted_relationships = [
             {
-                'source': r.get('from_id', r.get('source', '')).replace('person_', '').replace('organization_', '').replace('_', ' '),
-                'target': r.get('to_id', r.get('target', '')).replace('person_', '').replace('organization_', '').replace('project_', '').replace('invoice_', '').replace('agreement_', '').replace('_', ' '),
+                'source': r.get('source') or _strip_type_prefix(r.get('from_id', '')),
+                'target': r.get('target') or _strip_type_prefix(r.get('to_id', '')),
                 'relationship_type': r.get('type', r.get('relationship_type', 'RELATED_TO')),
                 'confidence': r.get('confidence', 0.8)
             }
@@ -441,10 +449,18 @@ def process_text():
         
         # Get relationships and transform to frontend format
         raw_relationships = results.get('relationships', [])
+        def _strip_type_prefix(id_str):
+            """Dynamically strip type prefix (e.g. 'person_john_doe' -> 'john doe')"""
+            if not id_str:
+                return ''
+            if '_' in id_str:
+                return '_'.join(id_str.split('_')[1:]).replace('_', ' ')
+            return id_str
+        
         extracted_relationships = [
             {
-                'source': r.get('from_id', r.get('source', '')).replace('person_', '').replace('organization_', '').replace('_', ' '),
-                'target': r.get('to_id', r.get('target', '')).replace('person_', '').replace('organization_', '').replace('project_', '').replace('invoice_', '').replace('agreement_', '').replace('_', ' '),
+                'source': r.get('source') or _strip_type_prefix(r.get('from_id', '')),
+                'target': r.get('target') or _strip_type_prefix(r.get('to_id', '')),
                 'relationship_type': r.get('type', r.get('relationship_type', 'RELATED_TO')),
                 'confidence': r.get('confidence', 0.8)
             }
@@ -579,7 +595,9 @@ def advanced_semantic_search():
                 'query_expansion': list(set(query_expansion))[:15],
                 'results': [],
                 'total_found': len(results),
-                # NEW: Relationship-based answer components
+                # LLM-generated answer from search results
+                'llm_answer': '',
+                # Relationship-based answer components
                 'relationship_answer': {
                     'direct_answer': relationship_answer.direct_answer,
                     'explanation': relationship_answer.relationship_explanation,
@@ -676,7 +694,15 @@ def advanced_semantic_search():
                 except Exception as graph_err:
                     print(f"Graph context error: {graph_err}")
                     response['graph_context'] = []
-            
+
+            # Generate LLM-based answer from search results
+            if results:
+                try:
+                    llm_answer = engine.generate_answer_from_results(query, results)
+                    response['llm_answer'] = llm_answer
+                except Exception as ans_err:
+                    print(f"LLM answer generation error: {ans_err}")
+
             return jsonify(response), 200
             
         except Exception as e:
@@ -1109,6 +1135,65 @@ def get_graph_stats():
     except Exception as e:
         print(f"Stats error: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/clear-all-data', methods=['POST'])
+def clear_all_data():
+    """
+    Clear ALL stored documents and graph data from Weaviate and NebulaGraph.
+    This is a full reset of all stored data.
+    """
+    try:
+        results = {
+            "weaviate": {"deleted": 0, "success": False},
+            "nebula": {"deleted_vertices": 0, "deleted_edges": 0, "success": False},
+        }
+
+        # 1. Clear Weaviate
+        try:
+            from vector_database.weaviate_handler import WeaviateClient
+            wv = WeaviateClient()
+            if wv.client:
+                wv_result = wv.delete_all_documents()
+                results["weaviate"] = wv_result
+                print(f"Weaviate cleared: {wv_result}")
+        except Exception as e:
+            results["weaviate"]["error"] = str(e)
+            print(f"Weaviate clear error: {e}")
+
+        # 2. Clear NebulaGraph
+        try:
+            from knowledge_graph.nebula_handler import NebulaGraphClient
+            ng = NebulaGraphClient()
+            ng_result = ng.clear_all_data()
+            results["nebula"] = ng_result
+            print(f"NebulaGraph cleared: {ng_result}")
+        except Exception as e:
+            results["nebula"]["error"] = str(e)
+            print(f"NebulaGraph clear error: {e}")
+
+        # 3. Clear uploaded files
+        uploads_dir = os.path.join(os.path.dirname(__file__), 'uploads')
+        files_deleted = 0
+        if os.path.exists(uploads_dir):
+            for f in os.listdir(uploads_dir):
+                fpath = os.path.join(uploads_dir, f)
+                if os.path.isfile(fpath):
+                    os.remove(fpath)
+                    files_deleted += 1
+
+        total_deleted = results["weaviate"].get("deleted", 0) + results["nebula"].get("deleted_vertices", 0) + results["nebula"].get("deleted_edges", 0)
+
+        return jsonify({
+            "success": True,
+            "message": f"Cleared all data: {total_deleted} items removed, {files_deleted} files deleted",
+            "details": results,
+            "files_deleted": files_deleted,
+        }), 200
+
+    except Exception as e:
+        print(f"Clear all data error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route('/api/clear-demo-data', methods=['POST'])
