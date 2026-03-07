@@ -146,7 +146,7 @@ GEMINI_API_KEY=...
 # OR Ollama (local)
 LLM_PROVIDER=ollama
 OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL=llama2
+OLLAMA_MODEL=llama3
 ```
 
 **Database Configuration:**
